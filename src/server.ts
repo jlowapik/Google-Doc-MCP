@@ -2467,28 +2467,45 @@ execute: async (args, { log }) => {
 }
 });
 
+// --- Environment variables for remote deployment ---
+const PORT = parseInt(process.env.PORT || "8080", 10);
+const HOST = process.env.HOST || "0.0.0.0";
+const TRANSPORT = process.env.TRANSPORT || "stdio"; // "stdio" or "httpStream"
+
 // --- Server Startup ---
 async function startServer() {
-try {
-await initializeGoogleClient(); // Authorize BEFORE starting listeners
-console.error("Starting Ultimate Google Docs & Sheets MCP server...");
+  try {
+    await initializeGoogleClient(); // Authorize BEFORE starting listeners
+    console.error("Starting Google Docs MCP Server...");
+    console.error(`Mode: ${TRANSPORT}, Port: ${PORT}`);
 
-      // Using stdio as before
-      const configToUse = {
-          transportType: "stdio" as const,
-      };
+    if (TRANSPORT === "httpStream" || TRANSPORT === "http" || TRANSPORT === "remote") {
+      // HTTP Streaming mode - for Railway/remote deployment
+      // This ALSO exposes SSE endpoint at /sse automatically!
+      server.start({
+        transportType: "httpStream",
+        httpStream: {
+          port: PORT,
+          host: HOST,
+        },
+      });
+      console.error(`Server running!`);
+      console.error(`   HTTP Streaming: http://${HOST}:${PORT}/mcp`);
+      console.error(`   SSE Endpoint:   http://${HOST}:${PORT}/sse  <-- Use this for Claude connectors`);
+      console.error(`   Health Check:   http://${HOST}:${PORT}/health`);
 
-      // Start the server with proper error handling
-      server.start(configToUse);
-      console.error(`MCP Server running using ${configToUse.transportType}. Awaiting client connection...`);
+    } else {
+      // Default: stdio mode for local Claude Desktop
+      server.start({
+        transportType: "stdio" as const,
+      });
+      console.error(`STDIO server running. Awaiting client connection...`);
+    }
 
-      // Log that error handling has been enabled
-      console.error('Process-level error handling configured to prevent crashes from timeout errors.');
-
-} catch(startError: any) {
-console.error("FATAL: Server failed to start:", startError.message || startError);
-process.exit(1);
+  } catch(startError: any) {
+    console.error("FATAL: Server failed to start:", startError.message || startError);
+    process.exit(1);
+  }
 }
-}
 
-startServer(); // Removed .catch here, let errors propagate if startup fails critically
+startServer();
