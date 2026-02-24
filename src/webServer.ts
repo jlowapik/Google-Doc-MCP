@@ -35,7 +35,7 @@ const BASE_SCOPES = [
 ];
 
 const BASE_URL = (process.env.BASE_URL || 'http://localhost:8080').replace(/\/+$/, '');
-const CANONICAL_HOST = new URL(BASE_URL).host;
+const CANONICAL_HOSTNAME = new URL(BASE_URL).hostname;
 const COOKIE_SECRET = process.env.COOKIE_SECRET || 'dev-secret-change-me';
 const SESSION_MAX_AGE = 7 * 24 * 60 * 60 * 1000; // 7 days
 
@@ -52,6 +52,7 @@ interface ApiAuthenticatedRequest extends Request {
 
 export function createWebApp(docsMcpPort: number, calendarMcpPort: number): express.Express {
   const app = express();
+  app.set('trust proxy', true);
 
   // Cookie parser middleware
   app.use(cookieParser(COOKIE_SECRET));
@@ -64,7 +65,8 @@ export function createWebApp(docsMcpPort: number, calendarMcpPort: number): expr
   // Redirect to canonical domain if BASE_URL is set and request is on a different host
   if (!BASE_URL.includes('localhost')) {
     app.use((req, res, next) => {
-      if (req.hostname !== CANONICAL_HOST && req.hostname !== 'localhost' && req.hostname !== '127.0.0.1') {
+      const host = (req.get('host') || '').split(':')[0];
+      if (host !== CANONICAL_HOSTNAME && host !== 'localhost' && host !== '127.0.0.1') {
         res.redirect(301, `${BASE_URL}${req.originalUrl}`);
         return;
       }
@@ -1104,6 +1106,7 @@ function findTabById(doc: any, tabId: string): any {
  */
 export function createWebOnlyApp(): express.Express {
   const app = express();
+  app.set('trust proxy', true);
 
   // Cookie parser middleware
   app.use(cookieParser(COOKIE_SECRET));
@@ -1116,7 +1119,8 @@ export function createWebOnlyApp(): express.Express {
   // Redirect to canonical domain if BASE_URL is set and request is on a different host
   if (!BASE_URL.includes('localhost')) {
     app.use((req, res, next) => {
-      if (req.hostname !== CANONICAL_HOST && req.hostname !== 'localhost' && req.hostname !== '127.0.0.1') {
+      const host = (req.get('host') || '').split(':')[0];
+      if (host !== CANONICAL_HOSTNAME && host !== 'localhost' && host !== '127.0.0.1') {
         res.redirect(301, `${BASE_URL}${req.originalUrl}`);
         return;
       }
