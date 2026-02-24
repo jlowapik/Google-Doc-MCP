@@ -35,6 +35,7 @@ const BASE_SCOPES = [
 ];
 
 const BASE_URL = (process.env.BASE_URL || 'http://localhost:8080').replace(/\/+$/, '');
+const CANONICAL_HOST = new URL(BASE_URL).host;
 const COOKIE_SECRET = process.env.COOKIE_SECRET || 'dev-secret-change-me';
 const SESSION_MAX_AGE = 7 * 24 * 60 * 60 * 1000; // 7 days
 
@@ -59,6 +60,17 @@ export function createWebApp(docsMcpPort: number, calendarMcpPort: number): expr
   app.get('/health', (_req, res) => {
     res.status(200).json({ status: 'ok' });
   });
+
+  // Redirect to canonical domain if BASE_URL is set and request is on a different host
+  if (!BASE_URL.includes('localhost')) {
+    app.use((req, res, next) => {
+      if (req.hostname !== CANONICAL_HOST && req.hostname !== 'localhost' && req.hostname !== '127.0.0.1') {
+        res.redirect(301, `${BASE_URL}${req.originalUrl}`);
+        return;
+      }
+      next();
+    });
+  }
 
   // NOTE: No OAuth routes registered here. MCP authentication uses apiKey
   // from the URL query string (issued via the dashboard). This prevents
@@ -1100,6 +1112,17 @@ export function createWebOnlyApp(): express.Express {
   app.get('/health', (_req, res) => {
     res.status(200).json({ status: 'ok' });
   });
+
+  // Redirect to canonical domain if BASE_URL is set and request is on a different host
+  if (!BASE_URL.includes('localhost')) {
+    app.use((req, res, next) => {
+      if (req.hostname !== CANONICAL_HOST && req.hostname !== 'localhost' && req.hostname !== '127.0.0.1') {
+        res.redirect(301, `${BASE_URL}${req.originalUrl}`);
+        return;
+      }
+      next();
+    });
+  }
 
   // NOTE: OAuth routes (registerOAuthRoutes) are NOT registered here.
   // In multi-service mode, MCP URLs include apiKey directly (from dashboard).
