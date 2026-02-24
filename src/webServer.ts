@@ -62,11 +62,13 @@ export function createWebApp(docsMcpPort: number, calendarMcpPort: number): expr
     res.status(200).json({ status: 'ok' });
   });
 
-  // Redirect to canonical domain if BASE_URL is set and request is on a different host
+  // Redirect to canonical domain if BASE_URL is set and request is on a different host.
+  // Railway rewrites the Host header, so we must use X-Forwarded-Host to get the original.
+  // If X-Forwarded-Host is absent, skip redirect (safe default to avoid loops).
   if (!BASE_URL.includes('localhost')) {
     app.use((req, res, next) => {
-      const host = (req.get('host') || '').split(':')[0];
-      if (host !== CANONICAL_HOSTNAME && host !== 'localhost' && host !== '127.0.0.1') {
+      const originalHost = (req.get('x-forwarded-host') || '').split(':')[0];
+      if (originalHost && originalHost !== CANONICAL_HOSTNAME) {
         res.redirect(301, `${BASE_URL}${req.originalUrl}`);
         return;
       }
@@ -1116,11 +1118,13 @@ export function createWebOnlyApp(): express.Express {
     res.status(200).json({ status: 'ok' });
   });
 
-  // Redirect to canonical domain if BASE_URL is set and request is on a different host
+  // Redirect to canonical domain if BASE_URL is set and request is on a different host.
+  // Railway rewrites the Host header, so we must use X-Forwarded-Host to get the original.
+  // If X-Forwarded-Host is absent, skip redirect (safe default to avoid loops).
   if (!BASE_URL.includes('localhost')) {
     app.use((req, res, next) => {
-      const host = (req.get('host') || '').split(':')[0];
-      if (host !== CANONICAL_HOSTNAME && host !== 'localhost' && host !== '127.0.0.1') {
+      const originalHost = (req.get('x-forwarded-host') || '').split(':')[0];
+      if (originalHost && originalHost !== CANONICAL_HOSTNAME) {
         res.redirect(301, `${BASE_URL}${req.originalUrl}`);
         return;
       }
