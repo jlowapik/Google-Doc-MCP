@@ -5,15 +5,26 @@ import express from 'express';
 import { OAuth2Client } from 'google-auth-library';
 import { google } from 'googleapis';
 import { isDatabaseAvailable, getRedis } from './db.js';
-import { loadUsers, createOrUpdateUser, getUserByApiKey } from './userStore.js';
+import { loadUsers, createOrUpdateUser, getUserByApiKey, getUserByGoogleId } from './userStore.js';
 import { loadClientCredentials } from './auth.js';
+import { getMcpCatalog } from './mcpCatalogStore.js';
+import { getSession } from './sessionStore.js';
+import { getMcpConnection } from './mcpConnectionStore.js';
 
-const SCOPES = [
+// Base scopes always needed (for user profile)
+const BASE_SCOPES = [
+  'https://www.googleapis.com/auth/userinfo.email',
+  'https://www.googleapis.com/auth/userinfo.profile',
+];
+
+// Default scopes when no specific MCP is requested
+const DEFAULT_SCOPES = [
+  ...BASE_SCOPES,
   'https://www.googleapis.com/auth/documents',
   'https://www.googleapis.com/auth/drive',
   'https://www.googleapis.com/auth/spreadsheets',
-  'https://www.googleapis.com/auth/userinfo.email',
-  'https://www.googleapis.com/auth/userinfo.profile',
+  'https://www.googleapis.com/auth/calendar',
+  'https://www.googleapis.com/auth/calendar.events',
 ];
 
 // --- Types ---
@@ -40,6 +51,7 @@ interface OAuthState {
   codeChallenge: string;
   codeChallengeMethod: string;
   state: string; // original state from Claude.ai
+  mcpSlug?: string; // optional MCP slug for dynamic scopes
 }
 
 // --- In-memory fallback stores ---
@@ -137,7 +149,26 @@ function verifyPKCE(codeVerifier: string, codeChallenge: string, method: string)
 // --- Route registration ---
 
 export function registerOAuthRoutes(app: express.Express): void {
-  const BASE_URL = process.env.BASE_URL || 'http://localhost:8080';
+  // Normalize BASE_URL: remove trailing slashes to prevent double-slash in redirect URIs
+  const BASE_URL = (process.env.BASE_URL || 'http://localhost:8080').replace(/\/+$/, '');
+  console.error(`[OAuth] BASE_URL configured as: ${BASE_URL}`);
+
+  // Debug endpoint: shows OAuth config so you know exactly what redirect URIs to register
+  app.get('/debug/oauth-config', async (_req, res) => {
+    try {
+      const { client_id } = await loadClientCredentials();
+      res.json({
+        base_url: BASE_URL,
+        google_client_id: client_id?.substring(0, 30) + '...',
+        redirect_uris_to_register: [
+          `${BASE_URL}/auth/callback`,
+        ],
+        note: 'Add ALL redirect_uris_to_register to your Google Cloud Console > APIs & Services > Credentials > OAuth 2.0 Client > Authorized redirect URIs',
+      });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
 
   // OAuth Authorization Server Metadata (RFC 8414)
   app.get('/.well-known/oauth-authorization-server', (_req, res) => {
@@ -225,6 +256,101 @@ export function registerOAuthRoutes(app: express.Express): void {
         return;
       }
 
+      // Try to extract MCP slug from scope parameter
+      // Claude sends scope like "google-docs" or "google-calendar"
+      let mcpSlug: string | undefined;
+      let mcpCatalog: Awaited<ReturnType<typeof getMcpCatalog>> = null;
+      let googleScopes = [...DEFAULT_SCOPES];
+
+      console.error(`OAuth: Received scope parameter: "${scope || '(none)'}"`);
+
+      if (scope && scope !== 'mcp') {
+        // Try to look up catalog by scope as MCP slug
+        const catalog = await getMcpCatalog(scope);
+        if (catalog) {
+          mcpSlug = scope;
+          mcpCatalog = catalog;
+          googleScopes = [...BASE_SCOPES, ...catalog.scopes];
+          console.error(`OAuth: Using dynamic scopes for MCP "${mcpSlug}": ${googleScopes.join(', ')}`);
+        }
+      }
+
+      // === Check if user is already logged in and has Google tokens ===
+      // This allows skipping redundant Google OAuth when adding connector to Claude.ai
+      const sessionId = req.signedCookies?.session;
+      console.error(`OAuth /authorize: sessionId=${sessionId ? sessionId.substring(0, 8) + '...' : 'none'}, clientId=${clientId}, redirectUri=${redirectUri}`);
+
+      if (sessionId) {
+        const session = await getSession(sessionId);
+        console.error(`OAuth /authorize: session found=${!!session}, expired=${session ? session.expiresAt < Date.now() : 'N/A'}`);
+
+        if (session && session.expiresAt > Date.now() && session.googleId) {
+          // Get user from session
+          const user = await getUserByGoogleId(session.googleId);
+          console.error(`OAuth /authorize: looked up user by googleId=${session.googleId}, found=${!!user}`);
+
+          if (user) {
+            // Determine which MCP the user is trying to connect
+            const targetMcpSlug = mcpSlug || 'google-docs';
+
+            // Check if user has valid Google tokens - either in user record OR in MCP connection
+            const hasUserTokens = !!(user.tokens && user.tokens.refresh_token);
+            const mcpConnection = user.id ? await getMcpConnection(user.id, targetMcpSlug) : null;
+            const hasMcpTokens = !!(mcpConnection && mcpConnection.googleTokens?.refresh_token);
+
+            console.error(`OAuth /authorize: user=${user.email}, hasUserTokens=${hasUserTokens}, hasMcpTokens=${hasMcpTokens}, targetMcp=${targetMcpSlug}`);
+
+            if (hasUserTokens || hasMcpTokens) {
+              // User has valid Google tokens - issue auth code directly
+              const authCode = crypto.randomBytes(32).toString('hex');
+              await storeAuthCode(authCode, {
+                apiKey: user.apiKey,
+                clientId,
+                codeChallenge,
+                codeChallengeMethod,
+                redirectUri,
+                expiresAt: Date.now() + 600_000,
+              });
+
+              const tokenSource = hasUserTokens ? 'user tokens' : `MCP "${targetMcpSlug}" connection`;
+              console.error(`OAuth: User ${user.email} already has ${tokenSource} - skipping Google OAuth, redirecting to ${redirectUri}`);
+
+              // Redirect back to Claude.ai with auth code
+              const callbackUrl = new URL(redirectUri);
+              callbackUrl.searchParams.set('code', authCode);
+              callbackUrl.searchParams.set('state', state);
+              res.redirect(callbackUrl.toString());
+              return;
+            } else {
+              // User is logged in but has no Google tokens - they need to connect an MCP first
+              console.error(`OAuth: User ${user.email} logged in but has no Google tokens (refresh_token empty) - showing error`);
+              res.status(403).send(`
+                <!DOCTYPE html>
+                <html>
+                <head>
+                  <title>MCP Not Connected</title>
+                  <style>
+                    body { font-family: system-ui, sans-serif; max-width: 600px; margin: 50px auto; padding: 20px; }
+                    h1 { color: #c53030; }
+                    a { color: #2563eb; }
+                  </style>
+                </head>
+                <body>
+                  <h1>MCP Not Connected</h1>
+                  <p>You need to connect the <strong>${targetMcpSlug}</strong> MCP on the website before adding it to Claude.ai.</p>
+                  <p><a href="${BASE_URL}/dashboard">Go to Dashboard</a> to connect this MCP first.</p>
+                </body>
+                </html>
+              `);
+              return;
+            }
+          }
+        }
+      }
+
+      // No valid session - proceed with normal Google OAuth flow
+      console.error('OAuth: No valid session found - proceeding with Google OAuth');
+
       // Generate internal state token to pass through Google OAuth
       const internalState = crypto.randomBytes(32).toString('hex');
 
@@ -234,16 +360,31 @@ export function registerOAuthRoutes(app: express.Express): void {
         codeChallenge,
         codeChallengeMethod,
         state, // Claude.ai's original state, returned in the final redirect
+        mcpSlug,
       });
 
       // Redirect to Google OAuth
-      const { client_id: googleClientId, client_secret: googleClientSecret } = await loadClientCredentials();
+      // Use MCP-specific Google credentials if available, otherwise use global credentials
+      let googleClientId: string;
+      let googleClientSecret: string;
+      if (mcpCatalog?.googleClientId && mcpCatalog?.googleClientSecret) {
+        googleClientId = mcpCatalog.googleClientId;
+        googleClientSecret = mcpCatalog.googleClientSecret;
+        console.error(`OAuth: Using MCP-specific Google credentials for "${mcpSlug}"`);
+      } else {
+        const globalCreds = await loadClientCredentials();
+        googleClientId = globalCreds.client_id;
+        googleClientSecret = globalCreds.client_secret;
+        console.error(`OAuth: Using global Google credentials`);
+      }
       const googleRedirectUri = `${BASE_URL}/auth/callback`;
+      console.error(`OAuth: Google redirect URI: ${googleRedirectUri}`);
+      console.error(`OAuth: Google Client ID: ${googleClientId?.substring(0, 20)}...`);
       const oauthClient = new OAuth2Client(googleClientId, googleClientSecret, googleRedirectUri);
 
       const authorizeUrl = oauthClient.generateAuthUrl({
         access_type: 'offline',
-        scope: SCOPES,
+        scope: googleScopes,
         prompt: 'consent',
         state: internalState,
       });

@@ -13,6 +13,10 @@ export interface McpCatalogEntry {
   description: string;
   iconUrl: string | null;
   mcpUrl: string;
+  scopes: string[];
+  googleClientId: string | null;
+  googleClientSecret: string | null;
+  oauthScopes: string[];
   isLocal: boolean;
   isActive: boolean;
   createdAt: string;
@@ -81,6 +85,10 @@ async function fileCreateMcpCatalog(
     existing.description = entry.description;
     existing.iconUrl = entry.iconUrl;
     existing.mcpUrl = entry.mcpUrl;
+    existing.scopes = entry.scopes;
+    existing.googleClientId = entry.googleClientId || existing.googleClientId;
+    existing.googleClientSecret = entry.googleClientSecret || existing.googleClientSecret;
+    existing.oauthScopes = entry.oauthScopes || existing.oauthScopes;
     existing.isLocal = entry.isLocal;
     existing.isActive = entry.isActive;
     existing.updatedAt = new Date().toISOString();
@@ -95,6 +103,10 @@ async function fileCreateMcpCatalog(
     description: entry.description,
     iconUrl: entry.iconUrl,
     mcpUrl: entry.mcpUrl,
+    scopes: entry.scopes,
+    googleClientId: entry.googleClientId || null,
+    googleClientSecret: entry.googleClientSecret || null,
+    oauthScopes: entry.oauthScopes || [],
     isLocal: entry.isLocal,
     isActive: entry.isActive,
     createdAt: new Date().toISOString(),
@@ -105,43 +117,12 @@ async function fileCreateMcpCatalog(
   return newEntry;
 }
 
-async function fileUpdateMcpCatalog(
-  slug: string,
-  updates: Partial<Omit<McpCatalogEntry, 'id' | 'slug' | 'createdAt' | 'updatedAt'>>
-): Promise<McpCatalogEntry | null> {
-  await fileLoadCatalog();
-  const existing = catalog.find(e => e.slug === slug);
-  if (!existing) return null;
-
-  if (updates.name !== undefined) existing.name = updates.name;
-  if (updates.description !== undefined) existing.description = updates.description;
-  if (updates.iconUrl !== undefined) existing.iconUrl = updates.iconUrl;
-  if (updates.mcpUrl !== undefined) existing.mcpUrl = updates.mcpUrl;
-  if (updates.isLocal !== undefined) existing.isLocal = updates.isLocal;
-  if (updates.isActive !== undefined) existing.isActive = updates.isActive;
-  existing.updatedAt = new Date().toISOString();
-
-  await saveCatalog();
-  return existing;
-}
-
-async function fileDeleteMcpCatalog(slug: string): Promise<boolean> {
-  await fileLoadCatalog();
-  const existing = catalog.find(e => e.slug === slug);
-  if (!existing) return false;
-
-  existing.isActive = false;
-  existing.updatedAt = new Date().toISOString();
-  await saveCatalog();
-  return true;
-}
-
 // ---------- Database-backed storage ----------
 
 async function dbListMcpCatalogs(): Promise<McpCatalogEntry[]> {
   const pool = getPool();
   const { rows } = await pool.query(
-    `SELECT id, slug, name, description, icon_url, mcp_url, is_local, is_active, created_at, updated_at
+    `SELECT id, slug, name, description, icon_url, mcp_url, scopes, google_client_id, google_client_secret, oauth_scopes, is_local, is_active, created_at, updated_at
      FROM mcp_catalog
      WHERE is_active = true
      ORDER BY name`
@@ -152,7 +133,7 @@ async function dbListMcpCatalogs(): Promise<McpCatalogEntry[]> {
 async function dbGetMcpCatalog(slug: string): Promise<McpCatalogEntry | null> {
   const pool = getPool();
   const { rows } = await pool.query(
-    `SELECT id, slug, name, description, icon_url, mcp_url, is_local, is_active, created_at, updated_at
+    `SELECT id, slug, name, description, icon_url, mcp_url, scopes, google_client_id, google_client_secret, oauth_scopes, is_local, is_active, created_at, updated_at
      FROM mcp_catalog
      WHERE slug = $1 AND is_active = true`,
     [slug]
@@ -166,84 +147,48 @@ async function dbCreateMcpCatalog(
 ): Promise<McpCatalogEntry> {
   const pool = getPool();
   const now = new Date();
+  const scopesJson = JSON.stringify(entry.scopes);
+  const oauthScopesJson = JSON.stringify(entry.oauthScopes || []);
 
   const { rows } = await pool.query(
-    `INSERT INTO mcp_catalog (slug, name, description, icon_url, mcp_url, is_local, is_active, created_at, updated_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8)
+    `INSERT INTO mcp_catalog (slug, name, description, icon_url, mcp_url, scopes, google_client_id, google_client_secret, oauth_scopes, is_local, is_active, created_at, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $12)
      ON CONFLICT (slug) DO UPDATE SET
        name = EXCLUDED.name,
        description = EXCLUDED.description,
        icon_url = EXCLUDED.icon_url,
        mcp_url = EXCLUDED.mcp_url,
+       scopes = EXCLUDED.scopes,
+       google_client_id = COALESCE(EXCLUDED.google_client_id, mcp_catalog.google_client_id),
+       google_client_secret = COALESCE(EXCLUDED.google_client_secret, mcp_catalog.google_client_secret),
+       oauth_scopes = COALESCE(EXCLUDED.oauth_scopes, mcp_catalog.oauth_scopes),
        is_local = EXCLUDED.is_local,
        is_active = EXCLUDED.is_active,
        updated_at = EXCLUDED.updated_at
-     RETURNING id, slug, name, description, icon_url, mcp_url, is_local, is_active, created_at, updated_at`,
-    [entry.slug, entry.name, entry.description, entry.iconUrl, entry.mcpUrl, entry.isLocal, entry.isActive, now]
+     RETURNING id, slug, name, description, icon_url, mcp_url, scopes, google_client_id, google_client_secret, oauth_scopes, is_local, is_active, created_at, updated_at`,
+    [entry.slug, entry.name, entry.description, entry.iconUrl, entry.mcpUrl, scopesJson, entry.googleClientId || null, entry.googleClientSecret || null, oauthScopesJson, entry.isLocal, entry.isActive, now]
   );
 
   return mapRowToEntry(rows[0]);
-}
-
-async function dbUpdateMcpCatalog(
-  slug: string,
-  updates: Partial<Omit<McpCatalogEntry, 'id' | 'slug' | 'createdAt' | 'updatedAt'>>
-): Promise<McpCatalogEntry | null> {
-  const pool = getPool();
-  const now = new Date();
-
-  // Build dynamic SET clause
-  const setClauses: string[] = ['updated_at = $1'];
-  const values: any[] = [now];
-  let paramIndex = 2;
-
-  if (updates.name !== undefined) {
-    setClauses.push(`name = $${paramIndex++}`);
-    values.push(updates.name);
-  }
-  if (updates.description !== undefined) {
-    setClauses.push(`description = $${paramIndex++}`);
-    values.push(updates.description);
-  }
-  if (updates.iconUrl !== undefined) {
-    setClauses.push(`icon_url = $${paramIndex++}`);
-    values.push(updates.iconUrl);
-  }
-  if (updates.mcpUrl !== undefined) {
-    setClauses.push(`mcp_url = $${paramIndex++}`);
-    values.push(updates.mcpUrl);
-  }
-  if (updates.isLocal !== undefined) {
-    setClauses.push(`is_local = $${paramIndex++}`);
-    values.push(updates.isLocal);
-  }
-  if (updates.isActive !== undefined) {
-    setClauses.push(`is_active = $${paramIndex++}`);
-    values.push(updates.isActive);
-  }
-
-  values.push(slug);
-
-  const { rows } = await pool.query(
-    `UPDATE mcp_catalog SET ${setClauses.join(', ')} WHERE slug = $${paramIndex}
-     RETURNING id, slug, name, description, icon_url, mcp_url, is_local, is_active, created_at, updated_at`,
-    values
-  );
-
-  if (rows.length === 0) return null;
-  return mapRowToEntry(rows[0]);
-}
-
-async function dbDeleteMcpCatalog(slug: string): Promise<boolean> {
-  const pool = getPool();
-  const { rowCount } = await pool.query(
-    `UPDATE mcp_catalog SET is_active = false, updated_at = NOW() WHERE slug = $1`,
-    [slug]
-  );
-  return (rowCount ?? 0) > 0;
 }
 
 function mapRowToEntry(row: any): McpCatalogEntry {
+  let scopes: string[] = [];
+  if (row.scopes) {
+    try {
+      scopes = typeof row.scopes === 'string' ? JSON.parse(row.scopes) : row.scopes;
+    } catch {
+      scopes = [];
+    }
+  }
+  let oauthScopes: string[] = [];
+  if (row.oauth_scopes) {
+    try {
+      oauthScopes = typeof row.oauth_scopes === 'string' ? JSON.parse(row.oauth_scopes) : row.oauth_scopes;
+    } catch {
+      oauthScopes = [];
+    }
+  }
   return {
     id: row.id,
     slug: row.slug,
@@ -251,6 +196,10 @@ function mapRowToEntry(row: any): McpCatalogEntry {
     description: row.description || '',
     iconUrl: row.icon_url,
     mcpUrl: row.mcp_url,
+    scopes,
+    googleClientId: row.google_client_id || null,
+    googleClientSecret: row.google_client_secret || null,
+    oauthScopes,
     isLocal: row.is_local,
     isActive: row.is_active,
     createdAt: row.created_at instanceof Date ? row.created_at.toISOString() : row.created_at,
@@ -283,33 +232,69 @@ export async function createMcpCatalog(
   return fileCreateMcpCatalog(entry);
 }
 
-export async function updateMcpCatalog(
-  slug: string,
-  updates: Partial<Omit<McpCatalogEntry, 'id' | 'slug' | 'createdAt' | 'updatedAt'>>
-): Promise<McpCatalogEntry | null> {
-  if (isDatabaseAvailable()) {
-    return dbUpdateMcpCatalog(slug, updates);
-  }
-  return fileUpdateMcpCatalog(slug, updates);
-}
-
-export async function deleteMcpCatalog(slug: string): Promise<boolean> {
-  if (isDatabaseAvailable()) {
-    return dbDeleteMcpCatalog(slug);
-  }
-  return fileDeleteMcpCatalog(slug);
-}
-
 export async function seedDefaultCatalogs(): Promise<void> {
   console.error('Seeding default MCP catalog entries...');
+
+  // For multi-service deployments, MCP URLs can be set via environment variables
+  // e.g., GOOGLE_DOCS_MCP_URL=https://google-docs-mcp-production.up.railway.app/mcp
+  // If not set, falls back to relative paths (for single-service MCP_MODE=all deployments)
+  const normalizeUrl = (url: string | undefined, defaultPath: string): string => {
+    if (!url) return defaultPath;
+    // Add https:// if missing protocol
+    if (!url.startsWith('http://') && !url.startsWith('https://') && !url.startsWith('/')) {
+      return 'https://' + url;
+    }
+    return url;
+  };
+
+  const googleDocsMcpUrl = normalizeUrl(process.env.GOOGLE_DOCS_MCP_URL, '/mcp');
+  const googleCalendarMcpUrl = normalizeUrl(process.env.GOOGLE_CALENDAR_MCP_URL, '/calendar');
+
+  console.error(`MCP URLs: google-docs=${googleDocsMcpUrl}, google-calendar=${googleCalendarMcpUrl}`);
 
   await createMcpCatalog({
     slug: 'google-docs',
     name: 'Google Docs MCP',
     description: 'Read, write, and manage Google Docs, Sheets, and Drive',
     iconUrl: null,
-    mcpUrl: '/mcp',
-    isLocal: true,
+    mcpUrl: googleDocsMcpUrl,
+    scopes: [
+      'https://www.googleapis.com/auth/documents',
+      'https://www.googleapis.com/auth/drive',
+      'https://www.googleapis.com/auth/spreadsheets',
+    ],
+    googleClientId: null,
+    googleClientSecret: null,
+    oauthScopes: [
+      'https://www.googleapis.com/auth/userinfo.email',
+      'https://www.googleapis.com/auth/userinfo.profile',
+      'https://www.googleapis.com/auth/documents',
+      'https://www.googleapis.com/auth/drive',
+      'https://www.googleapis.com/auth/spreadsheets',
+    ],
+    isLocal: process.env.GOOGLE_DOCS_MCP_URL ? false : true,
+    isActive: true,
+  });
+
+  await createMcpCatalog({
+    slug: 'google-calendar',
+    name: 'Google Calendar MCP',
+    description: 'Manage Google Calendar events and schedules',
+    iconUrl: null,
+    mcpUrl: googleCalendarMcpUrl,
+    scopes: [
+      'https://www.googleapis.com/auth/calendar',
+      'https://www.googleapis.com/auth/calendar.events',
+    ],
+    googleClientId: null,
+    googleClientSecret: null,
+    oauthScopes: [
+      'https://www.googleapis.com/auth/userinfo.email',
+      'https://www.googleapis.com/auth/userinfo.profile',
+      'https://www.googleapis.com/auth/calendar',
+      'https://www.googleapis.com/auth/calendar.events',
+    ],
+    isLocal: process.env.GOOGLE_CALENDAR_MCP_URL ? false : true,
     isActive: true,
   });
 

@@ -7,26 +7,34 @@ import { OAuth2Client } from 'google-auth-library';
 import { createProxyMiddleware } from 'http-proxy-middleware';
 import crypto from 'crypto';
 import cookieParser from 'cookie-parser';
-import { loadUsers, createOrUpdateUser, getUserByGoogleId, getUserByApiKey, regenerateApiKey, UserRecord } from './userStore.js';
+import { loadUsers, createOrUpdateUser, getUserByGoogleId, getUserByApiKey, getUserById, regenerateApiKey, UserRecord } from './userStore.js';
 import { loadClientCredentials } from './auth.js';
-import { registerOAuthRoutes, getOAuthState, deleteOAuthState, storeAuthCode } from './oauthServer.js';
+import { getOAuthState, deleteOAuthState, storeAuthCode } from './oauthServer.js';
 import { createSession, getSession, deleteSession, Session } from './sessionStore.js';
 import { clearSessionCache, createUserSession, UserSession } from './userSession.js';
-import { listMcpCatalogs, getMcpCatalog, createMcpCatalog, updateMcpCatalog, deleteMcpCatalog } from './mcpCatalogStore.js';
+import { listMcpCatalogs, getMcpCatalog } from './mcpCatalogStore.js';
+import {
+  connectMcp,
+  getMcpConnection,
+  getUserConnectedMcps,
+  disconnectMcp,
+  createMcpInstance,
+  getMcpConnectionByInstanceId,
+  updateMcpInstanceName,
+  disconnectMcpInstance
+} from './mcpConnectionStore.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const publicDir = path.resolve(__dirname, '..', 'public');
 
-const SCOPES = [
-  'https://www.googleapis.com/auth/documents',
-  'https://www.googleapis.com/auth/drive',
-  'https://www.googleapis.com/auth/spreadsheets',
+// Base scopes for registration/login (only profile info, no MCP permissions)
+const BASE_SCOPES = [
   'https://www.googleapis.com/auth/userinfo.email',
   'https://www.googleapis.com/auth/userinfo.profile',
 ];
 
-const BASE_URL = process.env.BASE_URL || 'http://localhost:8080';
+const BASE_URL = (process.env.BASE_URL || 'http://localhost:8080').replace(/\/+$/, '');
 const COOKIE_SECRET = process.env.COOKIE_SECRET || 'dev-secret-change-me';
 const SESSION_MAX_AGE = 7 * 24 * 60 * 60 * 1000; // 7 days
 
@@ -41,7 +49,7 @@ interface ApiAuthenticatedRequest extends Request {
   user?: UserRecord;
 }
 
-export function createWebApp(internalMcpPort: number): express.Express {
+export function createWebApp(docsMcpPort: number, calendarMcpPort: number): express.Express {
   const app = express();
 
   // Cookie parser middleware
@@ -52,46 +60,66 @@ export function createWebApp(internalMcpPort: number): express.Express {
     res.status(200).json({ status: 'ok' });
   });
 
-  // MCP OAuth authorization server endpoints (must be before proxy)
-  registerOAuthRoutes(app);
+  // NOTE: No OAuth routes registered here. MCP authentication uses apiKey
+  // from the URL query string (issued via the dashboard). This prevents
+  // Claude.ai from discovering OAuth and triggering a second Google consent.
 
-  // Proxy MCP endpoints to internal FastMCP server
-  const mcpProxy = createProxyMiddleware({
-    target: `http://127.0.0.1:${internalMcpPort}`,
+  // Proxy MCP endpoints to internal FastMCP servers
+  const docsProxy = createProxyMiddleware({
+    target: `http://127.0.0.1:${docsMcpPort}`,
     changeOrigin: true,
     ws: true,
     pathFilter: ['/mcp', '/sse'],
   });
-  app.use(mcpProxy);
+  app.use(docsProxy);
 
-  // Registration page - redirect to dashboard if already logged in
+  // Calendar MCP proxy
+  const calendarProxy = createProxyMiddleware({
+    target: `http://127.0.0.1:${calendarMcpPort}`,
+    changeOrigin: true,
+    ws: true,
+    pathFilter: ['/calendar', '/calendar-sse'],
+    pathRewrite: {
+      '^/calendar-sse': '/sse',
+      '^/calendar': '/mcp',
+    },
+  });
+  app.use(calendarProxy);
+
+  // Portal landing page - always show (no redirect to dashboard)
   // Must be before express.static to intercept requests for /
-  app.get('/', async (req: AuthenticatedRequest, res) => {
-    const sessionId = req.signedCookies?.session;
-    if (sessionId) {
-      const session = await getSession(sessionId);
-      if (session && session.expiresAt > Date.now()) {
-        res.redirect('/dashboard');
-        return;
-      }
-    }
+  app.get('/', (_req, res) => {
     res.sendFile(path.join(publicDir, 'index.html'));
+  });
+
+  // Login shortcut - redirect to Google OAuth
+  app.get('/login', (_req, res) => {
+    res.redirect('/auth/google');
+  });
+
+  // Dashboard - always serve the page (JS handles auth via /api/me)
+  app.get('/dashboard', (_req, res) => {
+    res.sendFile(path.join(publicDir, 'dashboard.html'));
   });
 
   // Serve static files
   app.use(express.static(publicDir));
 
-  // Start OAuth flow
+  // Start OAuth flow - only requests basic profile scopes
+  // MCP-specific scopes are requested when user connects each MCP
   app.get('/auth/google', async (_req, res) => {
     try {
       const { client_id, client_secret } = await loadClientCredentials();
       const redirectUri = `${BASE_URL}/auth/callback`;
       const oauthClient = new OAuth2Client(client_id, client_secret, redirectUri);
 
+      // Only request basic profile scopes for registration/login.
+      // No consent screen needed here — scopes are granted once when
+      // the user connects each MCP on the dashboard.
       const authorizeUrl = oauthClient.generateAuthUrl({
-        access_type: 'offline',
-        scope: SCOPES,
-        prompt: 'consent',  // Force consent to always get refresh_token
+        access_type: 'online',
+        scope: BASE_SCOPES,
+        prompt: 'select_account',
       });
 
       res.redirect(authorizeUrl);
@@ -112,7 +140,36 @@ export function createWebApp(internalMcpPort: number): express.Express {
     }
 
     try {
-      const { client_id, client_secret } = await loadClientCredentials();
+      // Determine which Google credentials to use:
+      // If this callback is from an MCP OAuth flow, use MCP-specific credentials if available
+      let client_id: string;
+      let client_secret: string;
+
+      if (stateParam) {
+        const oauthState = await getOAuthState(stateParam);
+        if (oauthState?.mcpSlug) {
+          const mcp = await getMcpCatalog(oauthState.mcpSlug);
+          if (mcp?.googleClientId && mcp?.googleClientSecret) {
+            client_id = mcp.googleClientId;
+            client_secret = mcp.googleClientSecret;
+            console.error(`[auth/callback] Using MCP-specific credentials for "${oauthState.mcpSlug}"`);
+          } else {
+            const globalCreds = await loadClientCredentials();
+            client_id = globalCreds.client_id;
+            client_secret = globalCreds.client_secret;
+          }
+          // Don't delete the state yet - we still need it below
+        } else {
+          const globalCreds = await loadClientCredentials();
+          client_id = globalCreds.client_id;
+          client_secret = globalCreds.client_secret;
+        }
+      } else {
+        const globalCreds = await loadClientCredentials();
+        client_id = globalCreds.client_id;
+        client_secret = globalCreds.client_secret;
+      }
+
       const redirectUri = `${BASE_URL}/auth/callback`;
       const oauthClient = new OAuth2Client(client_id, client_secret, redirectUri);
 
@@ -207,12 +264,16 @@ export function createWebApp(internalMcpPort: number): express.Express {
     next: NextFunction
   ): Promise<void> {
     const sessionId = req.signedCookies?.session;
+    console.error(`[requireAuth] path=${req.path}, sessionId=${sessionId ? sessionId.substring(0, 8) + '...' : 'none'}`);
     if (!sessionId) {
+      console.error(`[requireAuth] No session cookie`);
       res.status(401).json({ error: 'Not authenticated' });
       return;
     }
     const session = await getSession(sessionId);
+    console.error(`[requireAuth] session found=${!!session}, googleId=${session?.googleId || 'none'}`);
     if (!session || session.expiresAt < Date.now()) {
+      console.error(`[requireAuth] Session expired or not found`);
       res.clearCookie('session');
       res.status(401).json({ error: 'Session expired' });
       return;
@@ -221,36 +282,275 @@ export function createWebApp(internalMcpPort: number): express.Express {
     next();
   }
 
-  // Dashboard page (protected)
-  app.get('/dashboard', async (req: AuthenticatedRequest, res) => {
+  // JSON body parser for API routes
+  app.use(express.json());
+  app.use(express.urlencoded({ extended: true }));
+
+  // === Per-MCP OAuth Connection ===
+
+  // GET /connect/:mcpSlug - Start OAuth for specific MCP (legacy single-instance)
+  // GET /connect/:mcpSlug/new?name=... - Start OAuth for new instance
+  app.get('/connect/:mcpSlug', async (req: AuthenticatedRequest, res) => {
+    const mcpSlug = req.params.mcpSlug as string;
+    const instanceName = req.query.name as string | undefined;
     const sessionId = req.signedCookies?.session;
+
     if (!sessionId) {
-      res.redirect('/');
+      const redirectUrl = instanceName
+        ? `/connect/${mcpSlug}?name=${encodeURIComponent(instanceName)}`
+        : `/connect/${mcpSlug}`;
+      res.redirect(`/?redirect=${encodeURIComponent(redirectUrl)}`);
       return;
     }
     const session = await getSession(sessionId);
     if (!session || session.expiresAt < Date.now()) {
       res.clearCookie('session');
-      res.redirect('/');
+      const redirectUrl = instanceName
+        ? `/connect/${mcpSlug}?name=${encodeURIComponent(instanceName)}`
+        : `/connect/${mcpSlug}`;
+      res.redirect(`/?redirect=${encodeURIComponent(redirectUrl)}`);
       return;
     }
-    res.sendFile(path.join(publicDir, 'dashboard.html'));
+
+    try {
+      const mcp = await getMcpCatalog(mcpSlug);
+      if (!mcp) {
+        res.status(404).send('MCP not found');
+        return;
+      }
+
+      // Use MCP's Google credentials if available, otherwise use global credentials
+      const { client_id, client_secret } = mcp.googleClientId && mcp.googleClientSecret
+        ? { client_id: mcp.googleClientId, client_secret: mcp.googleClientSecret }
+        : await loadClientCredentials();
+
+      console.error(`[MCP Connect] Starting OAuth for MCP: ${mcpSlug}${instanceName ? ` (instance: ${instanceName})` : ''}`);
+      console.error(`[MCP Connect] Using MCP-specific credentials: ${!!(mcp.googleClientId)}`);
+      console.error(`[MCP Connect] Client ID prefix: ${client_id?.substring(0, 20)}...`);
+
+      const redirectUri = `${BASE_URL}/connect/${mcpSlug}/callback`;
+      const oauthClient = new OAuth2Client(client_id, client_secret, redirectUri);
+
+      // Generate state to verify callback
+      const state = crypto.randomBytes(32).toString('hex');
+
+      // Store state with session info (now includes instanceName for new instances)
+      const redis = await import('./db.js').then(m => m.isDatabaseAvailable() ? m.getRedis() : null);
+      const stateData = JSON.stringify({
+        sessionId,
+        mcpSlug,
+        googleId: session.googleId,
+        instanceName: instanceName || null, // null means legacy single-instance mode
+      });
+
+      if (redis) {
+        await redis.set(`mcp_connect_state:${state}`, stateData, 'EX', 600);
+      } else {
+        // Fallback to memory (not recommended for production)
+        (global as any).__mcpConnectStates = (global as any).__mcpConnectStates || new Map();
+        (global as any).__mcpConnectStates.set(state, stateData);
+        setTimeout(() => (global as any).__mcpConnectStates?.delete(state), 600_000);
+      }
+
+      // Use MCP's OAuth scopes
+      const scopes = mcp.oauthScopes.length > 0 ? mcp.oauthScopes : [
+        'https://www.googleapis.com/auth/userinfo.email',
+        'https://www.googleapis.com/auth/userinfo.profile',
+        ...mcp.scopes,
+      ];
+
+      const authorizeUrl = oauthClient.generateAuthUrl({
+        access_type: 'offline',
+        scope: scopes,
+        prompt: 'consent select_account',
+        state,
+      });
+
+      res.redirect(authorizeUrl);
+    } catch (err: any) {
+      console.error('MCP connect error:', err);
+      res.status(500).send('Failed to start connection. Please try again.');
+    }
+  });
+
+  // GET /connect/:mcpSlug/callback - OAuth callback for specific MCP
+  app.get('/connect/:mcpSlug/callback', async (req: AuthenticatedRequest, res) => {
+    const code = req.query.code as string | undefined;
+    const state = req.query.state as string | undefined;
+    const mcpSlug = req.params.mcpSlug as string;
+
+    if (!code || !state) {
+      res.status(400).send('Missing authorization code or state.');
+      return;
+    }
+
+    try {
+      // Verify state
+      let stateData: any;
+      const redis = await import('./db.js').then(m => m.isDatabaseAvailable() ? m.getRedis() : null);
+
+      if (redis) {
+        const stateJson = await redis.get(`mcp_connect_state:${state}`);
+        if (!stateJson) {
+          res.status(400).send('Invalid or expired state. Please try again.');
+          return;
+        }
+        stateData = JSON.parse(stateJson);
+        await redis.del(`mcp_connect_state:${state}`);
+      } else {
+        const stateJson = (global as any).__mcpConnectStates?.get(state);
+        if (!stateJson) {
+          res.status(400).send('Invalid or expired state. Please try again.');
+          return;
+        }
+        stateData = JSON.parse(stateJson);
+        (global as any).__mcpConnectStates?.delete(state);
+      }
+
+      if (stateData.mcpSlug !== mcpSlug) {
+        res.status(400).send('MCP slug mismatch.');
+        return;
+      }
+
+      const mcp = await getMcpCatalog(mcpSlug);
+      if (!mcp) {
+        res.status(404).send('MCP not found');
+        return;
+      }
+
+      // Use MCP's Google credentials if available
+      const { client_id, client_secret } = mcp.googleClientId && mcp.googleClientSecret
+        ? { client_id: mcp.googleClientId, client_secret: mcp.googleClientSecret }
+        : await loadClientCredentials();
+
+      const redirectUri = `${BASE_URL}/connect/${mcpSlug}/callback`;
+      const oauthClient = new OAuth2Client(client_id, client_secret, redirectUri);
+
+      // Exchange code for tokens
+      const { tokens } = await oauthClient.getToken(code);
+      oauthClient.setCredentials(tokens);
+
+      // Fetch the connected Google account's email
+      let googleEmail: string | null = null;
+      try {
+        const oauth2 = google.oauth2({ version: 'v2', auth: oauthClient });
+        const { data: profile } = await oauth2.userinfo.get();
+        googleEmail = profile.email || null;
+        console.error(`[MCP Connect] Google account email: ${googleEmail}`);
+      } catch (emailErr) {
+        console.error('[MCP Connect] Could not fetch Google email:', emailErr);
+      }
+
+      // Get user from session
+      const user = await getUserByGoogleId(stateData.googleId);
+      if (!user?.id) {
+        res.status(401).send('User not found. Please log in again.');
+        return;
+      }
+
+      const googleTokens = {
+        access_token: tokens.access_token!,
+        refresh_token: tokens.refresh_token || '',
+        scope: tokens.scope!,
+        token_type: tokens.token_type!,
+        expiry_date: tokens.expiry_date!,
+      };
+
+      // Check if this is a new instance (has instanceName) or legacy single-instance
+      let connection;
+      if (stateData.instanceName) {
+        // Create new instance with unique ID
+        connection = await createMcpInstance(
+          user.id,
+          mcpSlug,
+          stateData.instanceName,
+          googleTokens,
+          googleEmail
+        );
+        console.error(`User ${user.id} created MCP instance: ${connection.instanceId} (${stateData.instanceName})`);
+      } else {
+        // Legacy: single instance per MCP type
+        connection = await connectMcp(user.id, mcpSlug, googleTokens, undefined, googleEmail);
+        console.error(`User ${user.id} connected MCP: ${mcpSlug}`);
+      }
+
+      // Redirect to dashboard with success message
+      res.redirect('/dashboard?connected=' + encodeURIComponent(connection.instanceName || mcpSlug));
+    } catch (err: any) {
+      console.error('MCP connect callback error:', err);
+      res.status(500).send('Connection failed. Please try again.');
+    }
+  });
+
+  // POST /api/disconnect/:mcpSlug - Disconnect an MCP
+  app.post('/api/disconnect/:mcpSlug', requireAuth, async (req: AuthenticatedRequest, res) => {
+    try {
+      const mcpSlug = req.params.mcpSlug as string;
+
+      // Get user from session
+      const googleId = req.session!.googleId;
+      if (!googleId) {
+        res.clearCookie('session');
+        res.status(401).json({ error: 'Session invalid' });
+        return;
+      }
+
+      const user = await getUserByGoogleId(googleId);
+      if (!user?.id) {
+        res.status(401).json({ error: 'User not found' });
+        return;
+      }
+
+      const disconnected = await disconnectMcp(user.id, mcpSlug);
+      if (!disconnected) {
+        res.status(404).json({ error: 'Connection not found' });
+        return;
+      }
+
+      console.error(`User ${user.id} disconnected MCP: ${mcpSlug}`);
+      res.json({ success: true });
+    } catch (err: any) {
+      console.error('Disconnect error:', err);
+      res.status(500).json({ error: 'Failed to disconnect' });
+    }
   });
 
   // API endpoint to get current user info (protected)
   app.get('/api/me', requireAuth, async (req: AuthenticatedRequest, res) => {
     try {
       await loadUsers();
-      const user = await getUserByGoogleId(req.session!.googleId);
+
+      // Get user from session - handle old sessions that might not have googleId
+      const googleId = req.session!.googleId;
+      if (!googleId) {
+        console.error('/api/me: Session missing googleId, clearing session');
+        res.clearCookie('session');
+        res.status(401).json({ error: 'Session invalid, please sign in again' });
+        return;
+      }
+
+      const user = await getUserByGoogleId(googleId);
       if (!user) {
+        console.error(`/api/me: User not found for googleId=${googleId}`);
         res.status(404).json({ error: 'User not found' });
         return;
       }
+
+      // Get user's MCP connections
+      const connections = user.id ? await getUserConnectedMcps(user.id) : [];
+
       res.json({
         email: user.email,
         name: user.name,
         apiKey: user.apiKey,
-        isAdmin: user.isAdmin === true,
+        authMethod: user.authMethod,
+        connections: connections.map(c => ({
+          mcpSlug: c.mcpSlug,
+          instanceId: c.instanceId,
+          instanceName: c.instanceName,
+          googleEmail: c.googleEmail,
+          connectedAt: c.connectedAt,
+        })),
       });
     } catch (err: any) {
       console.error('Error fetching user:', err);
@@ -258,10 +558,173 @@ export function createWebApp(internalMcpPort: number): express.Express {
     }
   });
 
+  // API endpoint to get user's MCP connections
+  app.get('/api/me/connections', requireAuth, async (req: AuthenticatedRequest, res) => {
+    try {
+      // Get user from session
+      const googleId = req.session!.googleId;
+      if (!googleId) {
+        res.clearCookie('session');
+        res.status(401).json({ error: 'Session invalid' });
+        return;
+      }
+
+      const user = await getUserByGoogleId(googleId);
+      if (!user?.id) {
+        res.status(404).json({ error: 'User not found' });
+        return;
+      }
+
+      const connections = await getUserConnectedMcps(user.id);
+
+      res.json({
+        connections: connections.map(c => ({
+          mcpSlug: c.mcpSlug,
+          connectedAt: c.connectedAt,
+        })),
+      });
+    } catch (err: any) {
+      console.error('Error fetching connections:', err);
+      res.status(500).json({ error: 'Failed to fetch connections' });
+    }
+  });
+
+  // API endpoint to get user's MCP instances (new multi-instance API)
+  app.get('/api/me/instances', requireAuth, async (req: AuthenticatedRequest, res) => {
+    try {
+      const googleId = req.session!.googleId;
+      if (!googleId) {
+        res.clearCookie('session');
+        res.status(401).json({ error: 'Session invalid' });
+        return;
+      }
+
+      const user = await getUserByGoogleId(googleId);
+      if (!user?.id) {
+        res.status(404).json({ error: 'User not found' });
+        return;
+      }
+
+      const connections = await getUserConnectedMcps(user.id);
+
+      res.json({
+        instances: connections.map(c => ({
+          instanceId: c.instanceId,
+          instanceName: c.instanceName,
+          mcpSlug: c.mcpSlug,
+          googleEmail: c.googleEmail,
+          connectedAt: c.connectedAt,
+        })),
+      });
+    } catch (err: any) {
+      console.error('Error fetching instances:', err);
+      res.status(500).json({ error: 'Failed to fetch instances' });
+    }
+  });
+
+  // PATCH /api/instances/:instanceId - Update instance name
+  app.patch('/api/instances/:instanceId', requireAuth, async (req: AuthenticatedRequest, res) => {
+    try {
+      const instanceId = req.params.instanceId as string;
+      const { name } = req.body;
+
+      if (!name || typeof name !== 'string' || name.trim().length === 0) {
+        res.status(400).json({ error: 'Name is required' });
+        return;
+      }
+
+      const googleId = req.session!.googleId;
+      if (!googleId) {
+        res.clearCookie('session');
+        res.status(401).json({ error: 'Session invalid' });
+        return;
+      }
+
+      const user = await getUserByGoogleId(googleId);
+      if (!user?.id) {
+        res.status(401).json({ error: 'User not found' });
+        return;
+      }
+
+      // Verify user owns this instance
+      const connection = await getMcpConnectionByInstanceId(instanceId);
+      if (!connection) {
+        res.status(404).json({ error: 'Instance not found' });
+        return;
+      }
+      if (connection.userId !== user.id) {
+        res.status(403).json({ error: 'Access denied' });
+        return;
+      }
+
+      const updated = await updateMcpInstanceName(instanceId, name.trim());
+      if (!updated) {
+        res.status(404).json({ error: 'Instance not found' });
+        return;
+      }
+
+      console.error(`User ${user.id} renamed instance ${instanceId} to "${name.trim()}"`);
+      res.json({ success: true, instanceId, name: name.trim() });
+    } catch (err: any) {
+      console.error('Error updating instance:', err);
+      res.status(500).json({ error: 'Failed to update instance' });
+    }
+  });
+
+  // DELETE /api/instances/:instanceId - Delete an instance
+  app.delete('/api/instances/:instanceId', requireAuth, async (req: AuthenticatedRequest, res) => {
+    try {
+      const instanceId = req.params.instanceId as string;
+
+      const googleId = req.session!.googleId;
+      if (!googleId) {
+        res.clearCookie('session');
+        res.status(401).json({ error: 'Session invalid' });
+        return;
+      }
+
+      const user = await getUserByGoogleId(googleId);
+      if (!user?.id) {
+        res.status(401).json({ error: 'User not found' });
+        return;
+      }
+
+      // Verify user owns this instance
+      const connection = await getMcpConnectionByInstanceId(instanceId);
+      if (!connection) {
+        res.status(404).json({ error: 'Instance not found' });
+        return;
+      }
+      if (connection.userId !== user.id) {
+        res.status(403).json({ error: 'Access denied' });
+        return;
+      }
+
+      const deleted = await disconnectMcpInstance(instanceId);
+      if (!deleted) {
+        res.status(404).json({ error: 'Instance not found' });
+        return;
+      }
+
+      console.error(`User ${user.id} deleted instance ${instanceId}`);
+      res.json({ success: true });
+    } catch (err: any) {
+      console.error('Error deleting instance:', err);
+      res.status(500).json({ error: 'Failed to delete instance' });
+    }
+  });
+
   // Regenerate API key endpoint (protected)
   app.post('/api/regenerate-key', requireAuth, async (req: AuthenticatedRequest, res) => {
     try {
-      const user = await regenerateApiKey(req.session!.googleId);
+      const googleId = req.session!.googleId;
+      if (!googleId) {
+        res.clearCookie('session');
+        res.status(401).json({ error: 'Session invalid' });
+        return;
+      }
+
+      const user = await regenerateApiKey(googleId);
       if (!user) {
         res.status(404).json({ error: 'User not found' });
         return;
@@ -289,7 +752,9 @@ export function createWebApp(internalMcpPort: number): express.Express {
   // GET /api/v1/catalogs - List all active MCPs
   app.get('/api/v1/catalogs', async (_req, res) => {
     try {
+      console.error('[/api/v1/catalogs] Fetching catalogs...');
       const catalogs = await listMcpCatalogs();
+      console.error(`[/api/v1/catalogs] Found ${catalogs.length} catalogs`);
       res.json({
         catalogs: catalogs.map(c => ({
           slug: c.slug,
@@ -300,7 +765,7 @@ export function createWebApp(internalMcpPort: number): express.Express {
         })),
       });
     } catch (err: any) {
-      console.error('Error listing catalogs:', err);
+      console.error('[/api/v1/catalogs] Error:', err);
       res.status(500).json({ error: 'Failed to list catalogs' });
     }
   });
@@ -323,137 +788,6 @@ export function createWebApp(internalMcpPort: number): express.Express {
     } catch (err: any) {
       console.error('Error getting catalog:', err);
       res.status(500).json({ error: 'Failed to get catalog' });
-    }
-  });
-
-  // === Admin API Endpoints (protected) ===
-
-  // JSON body parser for admin endpoints
-  app.use('/api/v1/admin', express.json());
-
-  // Admin authentication middleware
-  async function requireAdmin(
-    req: AuthenticatedRequest,
-    res: Response,
-    next: NextFunction
-  ): Promise<void> {
-    const sessionId = req.signedCookies?.session;
-    if (!sessionId) {
-      res.status(401).json({ error: 'Not authenticated' });
-      return;
-    }
-    const session = await getSession(sessionId);
-    if (!session || session.expiresAt < Date.now()) {
-      res.clearCookie('session');
-      res.status(401).json({ error: 'Session expired' });
-      return;
-    }
-
-    await loadUsers();
-    const user = await getUserByGoogleId(session.googleId);
-    if (!user) {
-      res.status(404).json({ error: 'User not found' });
-      return;
-    }
-    if (!user.isAdmin) {
-      res.status(403).json({ error: 'Admin access required' });
-      return;
-    }
-
-    req.session = session;
-    next();
-  }
-
-  // POST /api/v1/admin/catalogs - Create new MCP
-  app.post('/api/v1/admin/catalogs', requireAdmin, async (req, res) => {
-    try {
-      const { slug, name, description, mcpUrl, iconUrl, isLocal } = req.body;
-
-      if (!slug || !name || !mcpUrl) {
-        res.status(400).json({ error: 'slug, name, and mcpUrl are required' });
-        return;
-      }
-
-      // Validate slug format (alphanumeric with hyphens)
-      if (!/^[a-z0-9-]+$/.test(slug)) {
-        res.status(400).json({ error: 'slug must contain only lowercase letters, numbers, and hyphens' });
-        return;
-      }
-
-      const catalog = await createMcpCatalog({
-        slug,
-        name,
-        description: description || '',
-        mcpUrl,
-        iconUrl: iconUrl || null,
-        isLocal: isLocal ?? true,
-        isActive: true,
-      });
-
-      console.error(`Admin: Created MCP catalog "${slug}"`);
-      res.status(201).json({
-        slug: catalog.slug,
-        name: catalog.name,
-        description: catalog.description,
-        iconUrl: catalog.iconUrl,
-        mcpUrl: catalog.mcpUrl,
-        isLocal: catalog.isLocal,
-      });
-    } catch (err: any) {
-      console.error('Error creating catalog:', err);
-      res.status(500).json({ error: 'Failed to create catalog' });
-    }
-  });
-
-  // PUT /api/v1/admin/catalogs/:slug - Update MCP
-  app.put('/api/v1/admin/catalogs/:slug', requireAdmin, async (req, res) => {
-    try {
-      const { name, description, mcpUrl, iconUrl, isLocal } = req.body;
-      const slug = req.params.slug as string;
-
-      const updates: any = {};
-      if (name !== undefined) updates.name = name;
-      if (description !== undefined) updates.description = description;
-      if (mcpUrl !== undefined) updates.mcpUrl = mcpUrl;
-      if (iconUrl !== undefined) updates.iconUrl = iconUrl;
-      if (isLocal !== undefined) updates.isLocal = isLocal;
-
-      const catalog = await updateMcpCatalog(slug, updates);
-      if (!catalog) {
-        res.status(404).json({ error: 'Catalog not found' });
-        return;
-      }
-
-      console.error(`Admin: Updated MCP catalog "${slug}"`);
-      res.json({
-        slug: catalog.slug,
-        name: catalog.name,
-        description: catalog.description,
-        iconUrl: catalog.iconUrl,
-        mcpUrl: catalog.mcpUrl,
-        isLocal: catalog.isLocal,
-      });
-    } catch (err: any) {
-      console.error('Error updating catalog:', err);
-      res.status(500).json({ error: 'Failed to update catalog' });
-    }
-  });
-
-  // DELETE /api/v1/admin/catalogs/:slug - Delete MCP (soft delete)
-  app.delete('/api/v1/admin/catalogs/:slug', requireAdmin, async (req, res) => {
-    try {
-      const slug = req.params.slug as string;
-      const deleted = await deleteMcpCatalog(slug);
-      if (!deleted) {
-        res.status(404).json({ error: 'Catalog not found' });
-        return;
-      }
-
-      console.error(`Admin: Deleted MCP catalog "${slug}"`);
-      res.json({ success: true });
-    } catch (err: any) {
-      console.error('Error deleting catalog:', err);
-      res.status(500).json({ error: 'Failed to delete catalog' });
     }
   });
 
@@ -498,8 +832,7 @@ export function createWebApp(internalMcpPort: number): express.Express {
     }
   }
 
-  // JSON body parser for API endpoints
-  app.use('/api/v1', express.json());
+  // JSON body parser already added above for auth routes
 
   // Serve OpenAPI spec
   app.get('/openapi.json', (_req, res) => {
@@ -750,4 +1083,735 @@ function findTabById(doc: any, tabId: string): any {
   };
 
   return searchTabs(doc.tabs);
+}
+
+/**
+ * Creates Express app for website-only mode (no MCP proxies).
+ * Used in multi-service deployments where MCPs run as separate Railway services.
+ * This handles: registration, login, dashboard, OAuth flows, and API endpoints.
+ */
+export function createWebOnlyApp(): express.Express {
+  const app = express();
+
+  // Cookie parser middleware
+  app.use(cookieParser(COOKIE_SECRET));
+
+  // Direct health check for Railway
+  app.get('/health', (_req, res) => {
+    res.status(200).json({ status: 'ok' });
+  });
+
+  // NOTE: OAuth routes (registerOAuthRoutes) are NOT registered here.
+  // In multi-service mode, MCP URLs include apiKey directly (from dashboard).
+  // If we advertise OAuth, Claude.ai would use it instead of the apiKey,
+  // losing the instanceId and picking wrong Google tokens.
+  //
+  // No proxy needed: Claude.ai connects directly to MCP services using the
+  // full URL from the dashboard (which includes the apiKey). Since MCP services
+  // don't advertise OAuth either, the apiKey is used as-is.
+
+  // Portal landing page - always show (no redirect to dashboard)
+  app.get('/', (_req, res) => {
+    res.sendFile(path.join(publicDir, 'index.html'));
+  });
+
+  // Login shortcut - redirect to Google OAuth
+  app.get('/login', (_req, res) => {
+    res.redirect('/auth/google');
+  });
+
+  // Dashboard - always serve the page (JS handles auth via /api/me)
+  app.get('/dashboard', (_req, res) => {
+    res.sendFile(path.join(publicDir, 'dashboard.html'));
+  });
+
+  // Serve static files
+  app.use(express.static(publicDir));
+
+  // Start OAuth flow - only requests basic profile scopes
+  app.get('/auth/google', async (_req, res) => {
+    try {
+      const { client_id, client_secret } = await loadClientCredentials();
+      const redirectUri = `${BASE_URL}/auth/callback`;
+      const oauthClient = new OAuth2Client(client_id, client_secret, redirectUri);
+
+      // Only request basic profile scopes for registration/login.
+      // No consent screen needed here — scopes are granted once when
+      // the user connects each MCP on the dashboard.
+      const authorizeUrl = oauthClient.generateAuthUrl({
+        access_type: 'online',
+        scope: BASE_SCOPES,
+        prompt: 'select_account',
+      });
+
+      res.redirect(authorizeUrl);
+    } catch (err: any) {
+      console.error('Error starting OAuth flow:', err);
+      res.status(500).send('Failed to start authentication. Check server configuration.');
+    }
+  });
+
+  // OAuth callback — handles both direct registration and MCP OAuth flows
+  app.get('/auth/callback', async (req, res) => {
+    const code = req.query.code as string | undefined;
+    const stateParam = req.query.state as string | undefined;
+
+    if (!code) {
+      res.status(400).send('Missing authorization code.');
+      return;
+    }
+
+    try {
+      // Determine which Google credentials to use:
+      // If this callback is from an MCP OAuth flow, use MCP-specific credentials if available
+      let client_id: string;
+      let client_secret: string;
+
+      if (stateParam) {
+        const oauthState = await getOAuthState(stateParam);
+        if (oauthState?.mcpSlug) {
+          const mcp = await getMcpCatalog(oauthState.mcpSlug);
+          if (mcp?.googleClientId && mcp?.googleClientSecret) {
+            client_id = mcp.googleClientId;
+            client_secret = mcp.googleClientSecret;
+            console.error(`[auth/callback] Using MCP-specific credentials for "${oauthState.mcpSlug}"`);
+          } else {
+            const globalCreds = await loadClientCredentials();
+            client_id = globalCreds.client_id;
+            client_secret = globalCreds.client_secret;
+          }
+        } else {
+          const globalCreds = await loadClientCredentials();
+          client_id = globalCreds.client_id;
+          client_secret = globalCreds.client_secret;
+        }
+      } else {
+        const globalCreds = await loadClientCredentials();
+        client_id = globalCreds.client_id;
+        client_secret = globalCreds.client_secret;
+      }
+
+      const redirectUri = `${BASE_URL}/auth/callback`;
+      const oauthClient = new OAuth2Client(client_id, client_secret, redirectUri);
+
+      const { tokens } = await oauthClient.getToken(code);
+      oauthClient.setCredentials(tokens);
+
+      const oauth2 = google.oauth2({ version: 'v2', auth: oauthClient });
+      const { data: profile } = await oauth2.userinfo.get();
+
+      if (!profile.email || !profile.id) {
+        res.status(400).send('Could not retrieve Google profile information.');
+        return;
+      }
+
+      await loadUsers();
+
+      const existingUser = await getUserByGoogleId(profile.id);
+
+      const user = await createOrUpdateUser(
+        {
+          email: profile.email,
+          googleId: profile.id,
+          name: profile.name || profile.email,
+        },
+        {
+          access_token: tokens.access_token!,
+          refresh_token: tokens.refresh_token || existingUser?.tokens?.refresh_token || '',
+          scope: tokens.scope!,
+          token_type: tokens.token_type!,
+          expiry_date: tokens.expiry_date!,
+        }
+      );
+
+      clearSessionCache(user.apiKey);
+
+      console.error(`User registered/updated: ${user.email} (API key: ${user.apiKey.substring(0, 8)}...)`);
+
+      if (stateParam) {
+        const oauthState = await getOAuthState(stateParam);
+        if (oauthState) {
+          await deleteOAuthState(stateParam);
+
+          const authCode = crypto.randomBytes(32).toString('hex');
+          await storeAuthCode(authCode, {
+            apiKey: user.apiKey,
+            clientId: oauthState.clientId,
+            codeChallenge: oauthState.codeChallenge,
+            codeChallengeMethod: oauthState.codeChallengeMethod,
+            redirectUri: oauthState.redirectUri,
+            expiresAt: Date.now() + 600_000,
+          });
+
+          const callbackUrl = new URL(oauthState.redirectUri);
+          callbackUrl.searchParams.set('code', authCode);
+          callbackUrl.searchParams.set('state', oauthState.state);
+
+          console.error(`MCP OAuth: redirecting to ${callbackUrl.origin} for client ${oauthState.clientId}`);
+          res.redirect(callbackUrl.toString());
+          return;
+        }
+      }
+
+      const sessionId = await createSession(profile.id);
+      res.cookie('session', sessionId, {
+        signed: true,
+        httpOnly: true,
+        secure: process.env.NODE_ENV === 'production',
+        sameSite: 'lax',
+        maxAge: SESSION_MAX_AGE,
+      });
+      res.redirect('/dashboard');
+    } catch (err: any) {
+      console.error('OAuth callback error:', err);
+      res.status(500).send('Authentication failed. Please try again.');
+    }
+  });
+
+  // Authentication middleware for protected routes
+  async function requireAuth(
+    req: AuthenticatedRequest,
+    res: Response,
+    next: NextFunction
+  ): Promise<void> {
+    const sessionId = req.signedCookies?.session;
+    console.error(`[requireAuth] path=${req.path}, sessionId=${sessionId ? sessionId.substring(0, 8) + '...' : 'none'}`);
+    if (!sessionId) {
+      console.error(`[requireAuth] No session cookie`);
+      res.status(401).json({ error: 'Not authenticated' });
+      return;
+    }
+    const session = await getSession(sessionId);
+    console.error(`[requireAuth] session found=${!!session}, googleId=${session?.googleId || 'none'}`);
+    if (!session || session.expiresAt < Date.now()) {
+      console.error(`[requireAuth] Session expired or not found`);
+      res.clearCookie('session');
+      res.status(401).json({ error: 'Session expired' });
+      return;
+    }
+    req.session = session;
+    next();
+  }
+
+  // JSON body parser for API routes
+  app.use(express.json());
+  app.use(express.urlencoded({ extended: true }));
+
+  // === Per-MCP OAuth Connection ===
+
+  // GET /connect/:mcpSlug - Start OAuth for specific MCP (supports multi-instance via ?name=)
+  app.get('/connect/:mcpSlug', async (req: AuthenticatedRequest, res) => {
+    const mcpSlug = req.params.mcpSlug as string;
+    const instanceName = req.query.name as string | undefined;
+    const sessionId = req.signedCookies?.session;
+
+    if (!sessionId) {
+      const redirectUrl = instanceName
+        ? `/connect/${mcpSlug}?name=${encodeURIComponent(instanceName)}`
+        : `/connect/${mcpSlug}`;
+      res.redirect(`/?redirect=${encodeURIComponent(redirectUrl)}`);
+      return;
+    }
+    const session = await getSession(sessionId);
+    if (!session || session.expiresAt < Date.now()) {
+      res.clearCookie('session');
+      const redirectUrl = instanceName
+        ? `/connect/${mcpSlug}?name=${encodeURIComponent(instanceName)}`
+        : `/connect/${mcpSlug}`;
+      res.redirect(`/?redirect=${encodeURIComponent(redirectUrl)}`);
+      return;
+    }
+
+    try {
+      const mcp = await getMcpCatalog(mcpSlug);
+      if (!mcp) {
+        res.status(404).send('MCP not found');
+        return;
+      }
+
+      const { client_id, client_secret } = mcp.googleClientId && mcp.googleClientSecret
+        ? { client_id: mcp.googleClientId, client_secret: mcp.googleClientSecret }
+        : await loadClientCredentials();
+
+      console.error(`[MCP Connect] Starting OAuth for MCP: ${mcpSlug}${instanceName ? ` (instance: ${instanceName})` : ''}`);
+
+      const redirectUri = `${BASE_URL}/connect/${mcpSlug}/callback`;
+      const oauthClient = new OAuth2Client(client_id, client_secret, redirectUri);
+
+      const state = crypto.randomBytes(32).toString('hex');
+
+      const redis = await import('./db.js').then(m => m.isDatabaseAvailable() ? m.getRedis() : null);
+      const stateData = JSON.stringify({
+        sessionId,
+        mcpSlug,
+        googleId: session.googleId,
+        instanceName: instanceName || null,
+      });
+
+      if (redis) {
+        await redis.set(`mcp_connect_state:${state}`, stateData, 'EX', 600);
+      } else {
+        (global as any).__mcpConnectStates = (global as any).__mcpConnectStates || new Map();
+        (global as any).__mcpConnectStates.set(state, stateData);
+        setTimeout(() => (global as any).__mcpConnectStates?.delete(state), 600_000);
+      }
+
+      const scopes = mcp.oauthScopes.length > 0 ? mcp.oauthScopes : [
+        'https://www.googleapis.com/auth/userinfo.email',
+        'https://www.googleapis.com/auth/userinfo.profile',
+        ...mcp.scopes,
+      ];
+
+      const authorizeUrl = oauthClient.generateAuthUrl({
+        access_type: 'offline',
+        scope: scopes,
+        prompt: 'consent select_account',
+        state,
+      });
+
+      res.redirect(authorizeUrl);
+    } catch (err: any) {
+      console.error('MCP connect error:', err);
+      res.status(500).send('Failed to start connection. Please try again.');
+    }
+  });
+
+  // GET /connect/:mcpSlug/callback - OAuth callback for specific MCP
+  app.get('/connect/:mcpSlug/callback', async (req: AuthenticatedRequest, res) => {
+    const code = req.query.code as string | undefined;
+    const state = req.query.state as string | undefined;
+    const mcpSlug = req.params.mcpSlug as string;
+
+    if (!code || !state) {
+      res.status(400).send('Missing authorization code or state.');
+      return;
+    }
+
+    try {
+      let stateData: any;
+      const redis = await import('./db.js').then(m => m.isDatabaseAvailable() ? m.getRedis() : null);
+
+      if (redis) {
+        const stateJson = await redis.get(`mcp_connect_state:${state}`);
+        if (!stateJson) {
+          res.status(400).send('Invalid or expired state. Please try again.');
+          return;
+        }
+        stateData = JSON.parse(stateJson);
+        await redis.del(`mcp_connect_state:${state}`);
+      } else {
+        const stateJson = (global as any).__mcpConnectStates?.get(state);
+        if (!stateJson) {
+          res.status(400).send('Invalid or expired state. Please try again.');
+          return;
+        }
+        stateData = JSON.parse(stateJson);
+        (global as any).__mcpConnectStates?.delete(state);
+      }
+
+      if (stateData.mcpSlug !== mcpSlug) {
+        res.status(400).send('MCP slug mismatch.');
+        return;
+      }
+
+      const mcp = await getMcpCatalog(mcpSlug);
+      if (!mcp) {
+        res.status(404).send('MCP not found');
+        return;
+      }
+
+      const { client_id, client_secret } = mcp.googleClientId && mcp.googleClientSecret
+        ? { client_id: mcp.googleClientId, client_secret: mcp.googleClientSecret }
+        : await loadClientCredentials();
+
+      const redirectUri = `${BASE_URL}/connect/${mcpSlug}/callback`;
+      const oauthClient = new OAuth2Client(client_id, client_secret, redirectUri);
+
+      const { tokens } = await oauthClient.getToken(code);
+      oauthClient.setCredentials(tokens);
+
+      // Fetch the connected Google account's email
+      let googleEmail: string | null = null;
+      try {
+        const oauth2 = google.oauth2({ version: 'v2', auth: oauthClient });
+        const { data: profile } = await oauth2.userinfo.get();
+        googleEmail = profile.email || null;
+        console.error(`[MCP Connect] Google account email: ${googleEmail}`);
+      } catch (emailErr) {
+        console.error('[MCP Connect] Could not fetch Google email:', emailErr);
+      }
+
+      // Get user from session
+      const user = await getUserByGoogleId(stateData.googleId);
+      if (!user?.id) {
+        res.status(401).send('User not found. Please log in again.');
+        return;
+      }
+
+      const googleTokens = {
+        access_token: tokens.access_token!,
+        refresh_token: tokens.refresh_token || '',
+        scope: tokens.scope!,
+        token_type: tokens.token_type!,
+        expiry_date: tokens.expiry_date!,
+      };
+
+      // Check if this is a new instance (has instanceName) or legacy single-instance
+      let connection;
+      if (stateData.instanceName) {
+        connection = await createMcpInstance(
+          user.id,
+          mcpSlug,
+          stateData.instanceName,
+          googleTokens,
+          googleEmail
+        );
+        console.error(`User ${user.id} created MCP instance: ${connection.instanceId} (${stateData.instanceName})`);
+      } else {
+        connection = await connectMcp(user.id, mcpSlug, googleTokens, undefined, googleEmail);
+        console.error(`User ${user.id} connected MCP: ${mcpSlug}`);
+      }
+
+      res.redirect('/dashboard?connected=' + encodeURIComponent(connection.instanceName || mcpSlug));
+    } catch (err: any) {
+      console.error('MCP connect callback error:', err);
+      res.status(500).send('Connection failed. Please try again.');
+    }
+  });
+
+  // POST /api/disconnect/:mcpSlug - Disconnect an MCP
+  app.post('/api/disconnect/:mcpSlug', requireAuth, async (req: AuthenticatedRequest, res) => {
+    try {
+      const mcpSlug = req.params.mcpSlug as string;
+
+      // Get user from session
+      const googleId = req.session!.googleId;
+      if (!googleId) {
+        res.clearCookie('session');
+        res.status(401).json({ error: 'Session invalid' });
+        return;
+      }
+
+      const user = await getUserByGoogleId(googleId);
+      if (!user?.id) {
+        res.status(401).json({ error: 'User not found' });
+        return;
+      }
+
+      const disconnected = await disconnectMcp(user.id, mcpSlug);
+      if (!disconnected) {
+        res.status(404).json({ error: 'Connection not found' });
+        return;
+      }
+
+      console.error(`User ${user.id} disconnected MCP: ${mcpSlug}`);
+      res.json({ success: true });
+    } catch (err: any) {
+      console.error('Disconnect error:', err);
+      res.status(500).json({ error: 'Failed to disconnect' });
+    }
+  });
+
+  // API endpoint to get current user info (protected)
+  app.get('/api/me', requireAuth, async (req: AuthenticatedRequest, res) => {
+    try {
+      await loadUsers();
+
+      // Get user from session - handle old sessions that might not have googleId
+      const googleId = req.session!.googleId;
+      if (!googleId) {
+        console.error('/api/me: Session missing googleId, clearing session');
+        res.clearCookie('session');
+        res.status(401).json({ error: 'Session invalid, please sign in again' });
+        return;
+      }
+
+      const user = await getUserByGoogleId(googleId);
+      if (!user) {
+        console.error(`/api/me: User not found for googleId=${googleId}`);
+        res.status(404).json({ error: 'User not found' });
+        return;
+      }
+
+      const connections = user.id ? await getUserConnectedMcps(user.id) : [];
+
+      res.json({
+        email: user.email,
+        name: user.name,
+        apiKey: user.apiKey,
+        authMethod: user.authMethod,
+        connections: connections.map(c => ({
+          mcpSlug: c.mcpSlug,
+          instanceId: c.instanceId,
+          instanceName: c.instanceName,
+          googleEmail: c.googleEmail,
+          connectedAt: c.connectedAt,
+        })),
+      });
+    } catch (err: any) {
+      console.error('Error fetching user:', err);
+      res.status(500).json({ error: 'Failed to fetch user data' });
+    }
+  });
+
+  // API endpoint to get user's MCP connections
+  app.get('/api/me/connections', requireAuth, async (req: AuthenticatedRequest, res) => {
+    try {
+      // Get user from session
+      const googleId = req.session!.googleId;
+      if (!googleId) {
+        res.clearCookie('session');
+        res.status(401).json({ error: 'Session invalid' });
+        return;
+      }
+
+      const user = await getUserByGoogleId(googleId);
+      if (!user?.id) {
+        res.status(404).json({ error: 'User not found' });
+        return;
+      }
+
+      const connections = await getUserConnectedMcps(user.id);
+
+      res.json({
+        connections: connections.map(c => ({
+          mcpSlug: c.mcpSlug,
+          connectedAt: c.connectedAt,
+        })),
+      });
+    } catch (err: any) {
+      console.error('Error fetching connections:', err);
+      res.status(500).json({ error: 'Failed to fetch connections' });
+    }
+  });
+
+  // API endpoint to get user's MCP instances (new multi-instance API)
+  app.get('/api/me/instances', requireAuth, async (req: AuthenticatedRequest, res) => {
+    try {
+      const googleId = req.session!.googleId;
+      if (!googleId) {
+        res.clearCookie('session');
+        res.status(401).json({ error: 'Session invalid' });
+        return;
+      }
+
+      const user = await getUserByGoogleId(googleId);
+      if (!user?.id) {
+        res.status(404).json({ error: 'User not found' });
+        return;
+      }
+
+      const connections = await getUserConnectedMcps(user.id);
+
+      res.json({
+        instances: connections.map(c => ({
+          instanceId: c.instanceId,
+          instanceName: c.instanceName,
+          mcpSlug: c.mcpSlug,
+          googleEmail: c.googleEmail,
+          connectedAt: c.connectedAt,
+        })),
+      });
+    } catch (err: any) {
+      console.error('Error fetching instances:', err);
+      res.status(500).json({ error: 'Failed to fetch instances' });
+    }
+  });
+
+  // PATCH /api/instances/:instanceId - Update instance name
+  app.patch('/api/instances/:instanceId', requireAuth, async (req: AuthenticatedRequest, res) => {
+    try {
+      const instanceId = req.params.instanceId as string;
+      const { name } = req.body;
+
+      if (!name || typeof name !== 'string' || name.trim().length === 0) {
+        res.status(400).json({ error: 'Name is required' });
+        return;
+      }
+
+      const googleId = req.session!.googleId;
+      if (!googleId) {
+        res.clearCookie('session');
+        res.status(401).json({ error: 'Session invalid' });
+        return;
+      }
+
+      const user = await getUserByGoogleId(googleId);
+      if (!user?.id) {
+        res.status(401).json({ error: 'User not found' });
+        return;
+      }
+
+      // Verify user owns this instance
+      const connection = await getMcpConnectionByInstanceId(instanceId);
+      if (!connection) {
+        res.status(404).json({ error: 'Instance not found' });
+        return;
+      }
+      if (connection.userId !== user.id) {
+        res.status(403).json({ error: 'Access denied' });
+        return;
+      }
+
+      const updated = await updateMcpInstanceName(instanceId, name.trim());
+      if (!updated) {
+        res.status(404).json({ error: 'Instance not found' });
+        return;
+      }
+
+      console.error(`User ${user.id} renamed instance ${instanceId} to "${name.trim()}"`);
+      res.json({ success: true, instanceId, name: name.trim() });
+    } catch (err: any) {
+      console.error('Error updating instance:', err);
+      res.status(500).json({ error: 'Failed to update instance' });
+    }
+  });
+
+  // DELETE /api/instances/:instanceId - Delete an instance
+  app.delete('/api/instances/:instanceId', requireAuth, async (req: AuthenticatedRequest, res) => {
+    try {
+      const instanceId = req.params.instanceId as string;
+
+      const googleId = req.session!.googleId;
+      if (!googleId) {
+        res.clearCookie('session');
+        res.status(401).json({ error: 'Session invalid' });
+        return;
+      }
+
+      const user = await getUserByGoogleId(googleId);
+      if (!user?.id) {
+        res.status(401).json({ error: 'User not found' });
+        return;
+      }
+
+      // Verify user owns this instance
+      const connection = await getMcpConnectionByInstanceId(instanceId);
+      if (!connection) {
+        res.status(404).json({ error: 'Instance not found' });
+        return;
+      }
+      if (connection.userId !== user.id) {
+        res.status(403).json({ error: 'Access denied' });
+        return;
+      }
+
+      const deleted = await disconnectMcpInstance(instanceId);
+      if (!deleted) {
+        res.status(404).json({ error: 'Instance not found' });
+        return;
+      }
+
+      console.error(`User ${user.id} deleted instance ${instanceId}`);
+      res.json({ success: true });
+    } catch (err: any) {
+      console.error('Error deleting instance:', err);
+      res.status(500).json({ error: 'Failed to delete instance' });
+    }
+  });
+
+  // Regenerate API key endpoint (protected)
+  app.post('/api/regenerate-key', requireAuth, async (req: AuthenticatedRequest, res) => {
+    try {
+      const googleId = req.session!.googleId;
+      if (!googleId) {
+        res.clearCookie('session');
+        res.status(401).json({ error: 'Session invalid' });
+        return;
+      }
+
+      const user = await regenerateApiKey(googleId);
+      if (!user) {
+        res.status(404).json({ error: 'User not found' });
+        return;
+      }
+      console.error(`API key regenerated for user: ${user.email} (new key: ${user.apiKey.substring(0, 8)}...)`);
+      res.json({ apiKey: user.apiKey });
+    } catch (err: any) {
+      console.error('Error regenerating API key:', err);
+      res.status(500).json({ error: 'Failed to regenerate API key' });
+    }
+  });
+
+  // Logout endpoint
+  app.post('/api/logout', async (req: AuthenticatedRequest, res) => {
+    const sessionId = req.signedCookies?.session;
+    if (sessionId) {
+      await deleteSession(sessionId);
+    }
+    res.clearCookie('session');
+    res.json({ success: true });
+  });
+
+  // === MCP Catalog API (public endpoints) ===
+
+  // GET /api/v1/catalogs - List all active MCPs
+  app.get('/api/v1/catalogs', async (_req, res) => {
+    try {
+      console.error('[/api/v1/catalogs] Fetching catalogs...');
+      const catalogs = await listMcpCatalogs();
+      console.error(`[/api/v1/catalogs] Found ${catalogs.length} catalogs`);
+      res.json({
+        catalogs: catalogs.map(c => ({
+          slug: c.slug,
+          name: c.name,
+          description: c.description,
+          iconUrl: c.iconUrl,
+          mcpUrl: c.mcpUrl,
+        })),
+      });
+    } catch (err: any) {
+      console.error('[/api/v1/catalogs] Error:', err);
+      res.status(500).json({ error: 'Failed to list catalogs' });
+    }
+  });
+
+  // GET /api/v1/catalogs/:slug - Get single MCP details
+  app.get('/api/v1/catalogs/:slug', async (req, res) => {
+    try {
+      const catalog = await getMcpCatalog(req.params.slug);
+      if (!catalog) {
+        res.status(404).json({ error: 'Catalog not found' });
+        return;
+      }
+      res.json({
+        slug: catalog.slug,
+        name: catalog.name,
+        description: catalog.description,
+        iconUrl: catalog.iconUrl,
+        mcpUrl: catalog.mcpUrl,
+      });
+    } catch (err: any) {
+      console.error('Error getting catalog:', err);
+      res.status(500).json({ error: 'Failed to get catalog' });
+    }
+  });
+
+  return app;
+}
+
+/**
+ * Creates Express app for MCP-only mode (no OAuth).
+ * Used in multi-service deployments where each MCP runs as a separate service.
+ * Authentication is handled via apiKey in the MCP URL (issued by the dashboard).
+ * OAuth is NOT exposed here so Claude.ai uses the apiKey directly instead of
+ * attempting a separate OAuth flow.
+ */
+export function createMcpOnlyApp(internalMcpPort: number): express.Express {
+  const app = express();
+
+  // Health check
+  app.get('/health', (_req, res) => {
+    res.status(200).json({ status: 'ok' });
+  });
+  // Proxy MCP requests to internal FastMCP server
+  const mcpProxy = createProxyMiddleware({
+    target: `http://127.0.0.1:${internalMcpPort}`,
+    changeOrigin: true,
+    ws: true,
+    pathFilter: ['/mcp', '/sse'],
+  });
+  app.use(mcpProxy);
+
+  return app;
 }

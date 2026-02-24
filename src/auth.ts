@@ -20,11 +20,24 @@ const CREDENTIALS_PATH = path.join(projectRootDir, 'credentials.json');
 // These allow reading credentials from environment variables instead of files
 
 /**
- * Get credentials config from GOOGLE_CREDENTIALS env var or credentials.json file
- * Priority: Environment variable > File
+ * Get credentials config from environment variables or credentials.json file
+ * Priority: GOOGLE_CLIENT_ID/SECRET > GOOGLE_CREDENTIALS > File
  */
 function getCredentialsConfig(): any {
-  // Priority 1: Environment variable (for Railway/cloud deployment)
+  // Priority 1: Direct client ID/secret env vars (for multi-service deployment)
+  // Each MCP service can have its own Google Cloud project credentials
+  if (process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET) {
+    console.error('Loading credentials from GOOGLE_CLIENT_ID/GOOGLE_CLIENT_SECRET env vars');
+    return {
+      web: {
+        client_id: process.env.GOOGLE_CLIENT_ID,
+        client_secret: process.env.GOOGLE_CLIENT_SECRET,
+        redirect_uris: [process.env.GOOGLE_REDIRECT_URI || 'http://localhost:8080/auth/callback'],
+      }
+    };
+  }
+
+  // Priority 2: JSON credentials env var (for single-service deployment)
   if (process.env.GOOGLE_CREDENTIALS) {
     try {
       console.error('Loading credentials from GOOGLE_CREDENTIALS env var');
@@ -34,7 +47,7 @@ function getCredentialsConfig(): any {
     }
   }
 
-  // Priority 2: Return null to let caller handle file loading
+  // Priority 3: Return null to let caller handle file loading
   return null;
 }
 

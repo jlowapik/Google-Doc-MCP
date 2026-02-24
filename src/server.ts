@@ -26,12 +26,13 @@ import * as GDocsHelpers from './googleDocsApiHelpers.js';
 import * as SheetsHelpers from './googleSheetsApiHelpers.js';
 
 // Multi-user imports
-import { UserSession } from './userSession.js';
-import { createUserSession } from './userSession.js';
+import { UserSession, createUserSession, createUserSessionFromConnection } from './userSession.js';
 import { loadUsers, getUserByApiKey } from './userStore.js';
 import { initDatabase, closeDatabase } from './db.js';
 import { createWebApp } from './webServer.js';
-import { seedDefaultCatalogs } from './mcpCatalogStore.js';
+import { seedDefaultCatalogs, getMcpCatalog } from './mcpCatalogStore.js';
+import { calendarServer } from './calendarServer.js';
+import { getMcpConnection, getMcpConnectionByInstanceId } from './mcpConnectionStore.js';
 
 // Global clients for stdio (single-user) mode
 let authClient: OAuth2Client | null = null;
@@ -89,6 +90,9 @@ process.on('unhandledRejection', (reason, promise) => {
   // Don't exit process, just log the error and continue
 });
 
+// MCP slug for this server instance (set via environment variable or defaults to google-docs)
+const MCP_SLUG = process.env.MCP_SLUG || 'google-docs';
+
 const server = new FastMCP<UserSession>({
   name: 'Ultimate Google Docs & Sheets MCP Server',
   version: '1.0.0',
@@ -98,30 +102,113 @@ const server = new FastMCP<UserSession>({
 
     // Extract API key from Authorization header or query param
     const authHeader = request.headers['authorization'];
-    let apiKey: string | undefined;
+    let rawToken: string | undefined;
 
     if (authHeader?.startsWith('Bearer ')) {
-      apiKey = authHeader.slice(7);
+      rawToken = authHeader.slice(7);
     }
 
-    if (!apiKey) {
+    const url = new URL(request.url || '', 'http://localhost');
+
+    if (!rawToken) {
       // Try query param from URL
-      const url = new URL(request.url || '', 'http://localhost');
-      apiKey = url.searchParams.get('apiKey') || undefined;
+      rawToken = url.searchParams.get('apiKey') || undefined;
     }
 
-    if (!apiKey) {
+    if (!rawToken) {
       throw new Response(null, { status: 401, statusText: 'Missing API key. Provide Authorization: Bearer <key> header.' } as any);
     }
 
+    // Support compound token format: "apiKey.instanceId"
+    // This ensures instanceId survives MCP transport (SSE, streamable HTTP)
+    // which may not preserve query params on follow-up requests.
+    let apiKey: string;
+    let instanceId: string | undefined;
+
     await loadUsers();
+
+    const dotIndex = rawToken.lastIndexOf('.');
+    if (dotIndex > 0) {
+      const possibleApiKey = rawToken.substring(0, dotIndex);
+      const possibleInstanceId = rawToken.substring(dotIndex + 1);
+      // Verify the first part is a valid API key
+      const possibleUser = await getUserByApiKey(possibleApiKey);
+      if (possibleUser) {
+        apiKey = possibleApiKey;
+        instanceId = possibleInstanceId;
+      } else {
+        // Not a compound token, treat entire string as apiKey
+        apiKey = rawToken;
+      }
+    } else {
+      apiKey = rawToken;
+    }
+
+    // Also check query param for instanceId (backward compat)
+    if (!instanceId) {
+      instanceId = url.searchParams.get('instanceId') || undefined;
+    }
+
     const user = await getUserByApiKey(apiKey);
     if (!user) {
       throw new Response(null, { status: 401, statusText: 'Invalid API key.' } as any);
     }
 
-    const { client_id, client_secret } = await loadClientCredentials();
-    return createUserSession(user, client_id, client_secret);
+    if (!user.id) {
+      throw new Response(null, { status: 403, statusText: 'User ID not found. Please re-register.' } as any);
+    }
+
+    if (instanceId) {
+      // Instance-based routing - look up connection by instanceId
+      const connection = await getMcpConnectionByInstanceId(instanceId);
+      if (!connection) {
+        throw new Response(null, {
+          status: 404,
+          statusText: `Instance not found: ${instanceId}`
+        } as any);
+      }
+
+      // Verify user owns this instance
+      if (connection.userId !== user.id) {
+        throw new Response(null, {
+          status: 403,
+          statusText: 'You do not have access to this instance.'
+        } as any);
+      }
+
+      // Get MCP catalog to check for custom Google credentials
+      const mcp = await getMcpCatalog(connection.mcpSlug);
+      const { client_id, client_secret } = mcp?.googleClientId && mcp?.googleClientSecret
+        ? { client_id: mcp.googleClientId, client_secret: mcp.googleClientSecret }
+        : await loadClientCredentials();
+
+      // Create session from the instance's connection tokens
+      return createUserSessionFromConnection(user, connection, client_id, client_secret);
+    }
+
+    // Legacy flow (no instanceId): Always prefer MCP connection tokens over
+    // user's global tokens, because MCP connections have the correct Google scopes
+    // (Docs, Drive, Sheets, etc.) while global tokens may only have profile scopes.
+    const connection = await getMcpConnection(user.id, MCP_SLUG);
+    if (connection) {
+      const mcp = await getMcpCatalog(MCP_SLUG);
+      const { client_id, client_secret } = mcp?.googleClientId && mcp?.googleClientSecret
+        ? { client_id: mcp.googleClientId, client_secret: mcp.googleClientSecret }
+        : await loadClientCredentials();
+      return createUserSessionFromConnection(user, connection, client_id, client_secret);
+    }
+
+    // Fall back to user's global tokens (backward compat for users who registered
+    // with full scopes before per-MCP connections were introduced)
+    if (user.tokens && user.tokens.refresh_token) {
+      const { client_id, client_secret } = await loadClientCredentials();
+      return createUserSession(user, client_id, client_secret);
+    }
+
+    throw new Response(null, {
+      status: 403,
+      statusText: `MCP not connected. Visit the dashboard to connect ${MCP_SLUG}.`
+    } as any);
   },
 });
 
@@ -2651,41 +2738,121 @@ execute: async (args, { log, session }) => {
 const PORT = parseInt(process.env.PORT || "8080", 10);
 const HOST = process.env.HOST || "0.0.0.0";
 const TRANSPORT = process.env.TRANSPORT || "stdio"; // "stdio" or "httpStream"
-const INTERNAL_MCP_PORT = parseInt(process.env.INTERNAL_MCP_PORT || "3001", 10);
+const DOCS_MCP_PORT = parseInt(process.env.INTERNAL_MCP_PORT || "3001", 10);
+const CALENDAR_MCP_PORT = parseInt(process.env.CALENDAR_MCP_PORT || "3002", 10);
+
+// Multi-service deployment mode
+// - undefined or "all": Run everything (website + MCPs) - default single-service mode
+// - "web": Run only website (Express) without internal MCP servers
+// - "mcp": Run only the MCP server specified by MCP_SLUG (standalone, no proxy)
+const MCP_MODE = process.env.MCP_MODE || "all";
 
 // --- Server Startup ---
 async function startServer() {
   try {
     console.error("Starting Google Docs MCP Server...");
-    console.error(`Mode: ${TRANSPORT}, Port: ${PORT}`);
+    console.error(`Mode: ${TRANSPORT}, MCP_MODE: ${MCP_MODE}, Port: ${PORT}`);
 
     if (TRANSPORT === "httpStream" || TRANSPORT === "http" || TRANSPORT === "remote") {
-      // Multi-user HTTP mode — single public port with Express proxying to internal FastMCP
+      // Multi-user HTTP mode
       await initDatabase();
       await loadUsers();
-      await seedDefaultCatalogs();
 
-      // Start FastMCP on an internal-only port (Express will proxy /mcp, /sse, /health to it)
-      server.start({
-        transportType: "httpStream",
-        httpStream: {
-          port: INTERNAL_MCP_PORT,
-          host: "127.0.0.1",
-        },
-      });
+      // Only seed catalogs in web and all modes - MCP services shouldn't modify the catalog
+      if (MCP_MODE !== "mcp") {
+        await seedDefaultCatalogs();
+      }
 
-      // Create Express app with proxy routes and registration/OAuth pages
-      const expressApp = createWebApp(INTERNAL_MCP_PORT);
+      if (MCP_MODE === "web") {
+        // Website-only mode: Run Express without internal MCP servers
+        // Used in multi-service deployment where MCPs run as separate services
+        const { createWebOnlyApp } = await import('./webServer.js');
+        const expressApp = createWebOnlyApp();
 
-      // Start Express on the public port — single port for all traffic
-      expressApp.listen(PORT, HOST, () => {
-        console.error(`Server running on port ${PORT}!`);
-        console.error(`   MCP Endpoint:   http://${HOST}:${PORT}/mcp`);
-        console.error(`   SSE Endpoint:   http://${HOST}:${PORT}/sse`);
-        console.error(`   Health Check:   http://${HOST}:${PORT}/health`);
-        console.error(`   Registration:   http://${HOST}:${PORT}/`);
-        console.error(`   OAuth Callback: http://${HOST}:${PORT}/auth/callback`);
-      });
+        expressApp.listen(PORT, HOST, () => {
+          console.error(`Website running on port ${PORT}!`);
+          console.error(`   Health Check:   http://${HOST}:${PORT}/health`);
+          console.error(`   Registration:   http://${HOST}:${PORT}/`);
+          console.error(`   Dashboard:      http://${HOST}:${PORT}/dashboard`);
+          console.error(`   OAuth Callback: http://${HOST}:${PORT}/auth/callback`);
+        });
+
+      } else if (MCP_MODE === "mcp") {
+        // MCP-only mode: Run MCP server with OAuth routes for Claude.ai connector support
+        // Used in multi-service deployment where this service is one specific MCP
+        // NOTE: We skip seedDefaultCatalogs() here - the website service manages the catalog
+        const { createMcpOnlyApp } = await import('./webServer.js');
+        const INTERNAL_MCP_PORT = 3001;
+
+        if (MCP_SLUG === "google-calendar") {
+          // Start Calendar MCP on internal port
+          calendarServer.start({
+            transportType: "httpStream",
+            httpStream: {
+              port: INTERNAL_MCP_PORT,
+              host: "127.0.0.1",
+            },
+          });
+
+          // Create Express app with OAuth routes and MCP proxy
+          const expressApp = createMcpOnlyApp(INTERNAL_MCP_PORT);
+          expressApp.listen(PORT, HOST, () => {
+            console.error(`Calendar MCP running on port ${PORT}!`);
+            console.error(`   MCP Endpoint:   http://${HOST}:${PORT}/mcp`);
+            console.error(`   OAuth Metadata: http://${HOST}:${PORT}/.well-known/oauth-authorization-server`);
+          });
+        } else {
+          // Default to google-docs MCP - start on internal port
+          server.start({
+            transportType: "httpStream",
+            httpStream: {
+              port: INTERNAL_MCP_PORT,
+              host: "127.0.0.1",
+            },
+          });
+
+          // Create Express app with OAuth routes and MCP proxy
+          const expressApp = createMcpOnlyApp(INTERNAL_MCP_PORT);
+          expressApp.listen(PORT, HOST, () => {
+            console.error(`Docs MCP running on port ${PORT}!`);
+            console.error(`   MCP Endpoint:   http://${HOST}:${PORT}/mcp`);
+            console.error(`   OAuth Metadata: http://${HOST}:${PORT}/.well-known/oauth-authorization-server`);
+          });
+        }
+
+      } else {
+        // Default "all" mode: Single service with Express + internal MCP servers
+        // Start Google Docs MCP on internal port
+        server.start({
+          transportType: "httpStream",
+          httpStream: {
+            port: DOCS_MCP_PORT,
+            host: "127.0.0.1",
+          },
+        });
+
+        // Start Google Calendar MCP on separate internal port
+        calendarServer.start({
+          transportType: "httpStream",
+          httpStream: {
+            port: CALENDAR_MCP_PORT,
+            host: "127.0.0.1",
+          },
+        });
+
+        // Create Express app with proxy routes and registration/OAuth pages
+        const expressApp = createWebApp(DOCS_MCP_PORT, CALENDAR_MCP_PORT);
+
+        // Start Express on the public port — single port for all traffic
+        expressApp.listen(PORT, HOST, () => {
+          console.error(`Server running on port ${PORT}!`);
+          console.error(`   Docs MCP:       http://${HOST}:${PORT}/mcp`);
+          console.error(`   Calendar MCP:   http://${HOST}:${PORT}/calendar`);
+          console.error(`   Health Check:   http://${HOST}:${PORT}/health`);
+          console.error(`   Registration:   http://${HOST}:${PORT}/`);
+          console.error(`   OAuth Callback: http://${HOST}:${PORT}/auth/callback`);
+        });
+      }
 
     } else {
       // Default: stdio mode for local Claude Desktop (single-user, backward compatible)

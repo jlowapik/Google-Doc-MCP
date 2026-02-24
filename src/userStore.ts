@@ -8,11 +8,12 @@ const DATA_DIR = process.env.DATA_DIR || './data';
 const USERS_FILE = path.join(DATA_DIR, 'users.json');
 
 export interface UserProfile {
+  id?: number;
   apiKey: string;
   email: string;
-  googleId: string;
+  googleId: string | null;
   name: string;
-  isAdmin: boolean;
+  authMethod: 'google' | 'password';
   createdAt: string;
   updatedAt: string;
 }
@@ -26,7 +27,7 @@ export interface UserTokens {
 }
 
 export interface UserRecord extends UserProfile {
-  tokens: UserTokens;
+  tokens?: UserTokens;
 }
 
 // ---------- File-based storage (fallback) ----------
@@ -70,21 +71,15 @@ async function saveUsers(): Promise<void> {
 }
 
 function fileGetUserByApiKey(apiKey: string): UserRecord | undefined {
-  const user = users[apiKey];
-  if (user) {
-    // Ensure isAdmin is always a boolean (handles legacy data without this field)
-    user.isAdmin = user.isAdmin === true;
-  }
-  return user;
+  return users[apiKey];
 }
 
 function fileGetUserByGoogleId(googleId: string): UserRecord | undefined {
-  const user = Object.values(users).find(u => u.googleId === googleId);
-  if (user) {
-    // Ensure isAdmin is always a boolean (handles legacy data without this field)
-    user.isAdmin = user.isAdmin === true;
-  }
-  return user;
+  return Object.values(users).find(u => u.googleId === googleId);
+}
+
+function fileGetUserByEmail(email: string): UserRecord | undefined {
+  return Object.values(users).find(u => u.email === email);
 }
 
 async function fileCreateOrUpdateUser(
@@ -107,7 +102,7 @@ async function fileCreateOrUpdateUser(
     email: profile.email,
     googleId: profile.googleId,
     name: profile.name,
-    isAdmin: false,
+    authMethod: 'google',
     tokens,
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
@@ -120,7 +115,11 @@ async function fileCreateOrUpdateUser(
 async function fileUpdateTokens(apiKey: string, tokens: Partial<UserTokens>): Promise<void> {
   const user = users[apiKey];
   if (!user) return;
-  user.tokens = { ...user.tokens, ...tokens };
+  if (!user.tokens) {
+    user.tokens = tokens as UserTokens;
+  } else {
+    user.tokens = { ...user.tokens, ...tokens };
+  }
   user.updatedAt = new Date().toISOString();
   await saveUsers();
 }
@@ -132,24 +131,32 @@ async function dbGetUserByApiKey(apiKey: string): Promise<UserRecord | undefined
   const redis = getRedis();
 
   const { rows } = await pool.query(
-    'SELECT api_key, email, google_id, name, is_admin, created_at, updated_at FROM users WHERE api_key = $1',
+    'SELECT id, api_key, email, google_id, name, auth_method, created_at, updated_at FROM users WHERE api_key = $1',
     [apiKey]
   );
   if (rows.length === 0) return undefined;
 
   const row = rows[0];
-  const tokensJson = await redis.get(`tokens:${row.google_id}`);
-  if (!tokensJson) return undefined;
+
+  // For password-based users, tokens may not exist (they use per-MCP connections)
+  let tokens: UserTokens | undefined;
+  if (row.google_id) {
+    const tokensJson = await redis.get(`tokens:${row.google_id}`);
+    if (tokensJson) {
+      tokens = JSON.parse(tokensJson);
+    }
+  }
 
   return {
+    id: row.id,
     apiKey: row.api_key,
     email: row.email,
     googleId: row.google_id,
     name: row.name,
-    isAdmin: row.is_admin === true,
+    authMethod: row.auth_method || 'google',
     createdAt: row.created_at.toISOString(),
     updatedAt: row.updated_at.toISOString(),
-    tokens: JSON.parse(tokensJson),
+    tokens,
   };
 }
 
@@ -158,24 +165,98 @@ async function dbGetUserByGoogleId(googleId: string): Promise<UserRecord | undef
   const redis = getRedis();
 
   const { rows } = await pool.query(
-    'SELECT api_key, email, google_id, name, is_admin, created_at, updated_at FROM users WHERE google_id = $1',
+    'SELECT id, api_key, email, google_id, name, auth_method, created_at, updated_at FROM users WHERE google_id = $1',
     [googleId]
   );
   if (rows.length === 0) return undefined;
 
   const row = rows[0];
+
+  // Tokens may not exist in Redis (e.g., expired or migrated user)
+  // Return user record without tokens - they'll be refreshed on next OAuth
+  let tokens: UserTokens | undefined;
   const tokensJson = await redis.get(`tokens:${row.google_id}`);
-  if (!tokensJson) return undefined;
+  if (tokensJson) {
+    tokens = JSON.parse(tokensJson);
+  }
 
   return {
+    id: row.id,
     apiKey: row.api_key,
     email: row.email,
     googleId: row.google_id,
     name: row.name,
-    isAdmin: row.is_admin === true,
+    authMethod: row.auth_method || 'google',
     createdAt: row.created_at.toISOString(),
     updatedAt: row.updated_at.toISOString(),
-    tokens: JSON.parse(tokensJson),
+    tokens,
+  };
+}
+
+async function dbGetUserByEmail(email: string): Promise<UserRecord | undefined> {
+  const pool = getPool();
+  const redis = getRedis();
+
+  const { rows } = await pool.query(
+    'SELECT id, api_key, email, google_id, name, auth_method, created_at, updated_at FROM users WHERE email = $1',
+    [email]
+  );
+  if (rows.length === 0) return undefined;
+
+  const row = rows[0];
+
+  // For password-based users, tokens may not exist
+  let tokens: UserTokens | undefined;
+  if (row.google_id) {
+    const tokensJson = await redis.get(`tokens:${row.google_id}`);
+    if (tokensJson) {
+      tokens = JSON.parse(tokensJson);
+    }
+  }
+
+  return {
+    id: row.id,
+    apiKey: row.api_key,
+    email: row.email,
+    googleId: row.google_id,
+    name: row.name,
+    authMethod: row.auth_method || 'google',
+    createdAt: row.created_at.toISOString(),
+    updatedAt: row.updated_at.toISOString(),
+    tokens,
+  };
+}
+
+async function dbGetUserById(id: number): Promise<UserRecord | undefined> {
+  const pool = getPool();
+  const redis = getRedis();
+
+  const { rows } = await pool.query(
+    'SELECT id, api_key, email, google_id, name, auth_method, created_at, updated_at FROM users WHERE id = $1',
+    [id]
+  );
+  if (rows.length === 0) return undefined;
+
+  const row = rows[0];
+
+  let tokens: UserTokens | undefined;
+  if (row.google_id) {
+    const tokensJson = await redis.get(`tokens:${row.google_id}`);
+    if (tokensJson) {
+      tokens = JSON.parse(tokensJson);
+    }
+  }
+
+  return {
+    id: row.id,
+    apiKey: row.api_key,
+    email: row.email,
+    googleId: row.google_id,
+    name: row.name,
+    authMethod: row.auth_method || 'google',
+    createdAt: row.created_at.toISOString(),
+    updatedAt: row.updated_at.toISOString(),
+    tokens,
   };
 }
 
@@ -188,18 +269,30 @@ async function dbCreateOrUpdateUser(
 
   const now = new Date();
 
-  // Check if user exists to preserve their apiKey and isAdmin status
-  const existing = await dbGetUserByGoogleId(profile.googleId);
+  // Check if user exists by googleId first, then by email (for password->google migration)
+  let existing = await dbGetUserByGoogleId(profile.googleId);
+  if (!existing) {
+    // Check if user exists with same email (password auth user linking Google)
+    const emailUser = await dbGetUserByEmail(profile.email);
+    if (emailUser) {
+      existing = emailUser;
+    }
+  }
   const apiKey = existing?.apiKey ?? generateApiKey();
 
+  // Use upsert on email to handle both cases:
+  // 1. New user (insert)
+  // 2. Existing user by googleId (update via google_id conflict)
+  // 3. Existing user by email only (update via email conflict - links Google account)
   const { rows } = await pool.query(
-    `INSERT INTO users (api_key, email, google_id, name, created_at, updated_at)
-     VALUES ($1, $2, $3, $4, $5, $5)
-     ON CONFLICT (google_id) DO UPDATE SET
-       email = EXCLUDED.email,
+    `INSERT INTO users (api_key, email, google_id, name, auth_method, created_at, updated_at)
+     VALUES ($1, $2, $3, $4, 'google', $5, $5)
+     ON CONFLICT (email) DO UPDATE SET
+       google_id = EXCLUDED.google_id,
        name = EXCLUDED.name,
+       auth_method = 'google',
        updated_at = EXCLUDED.updated_at
-     RETURNING api_key, email, google_id, name, is_admin, created_at, updated_at`,
+     RETURNING id, api_key, email, google_id, name, auth_method, created_at, updated_at`,
     [apiKey, profile.email, profile.googleId, profile.name, now]
   );
 
@@ -209,11 +302,12 @@ async function dbCreateOrUpdateUser(
   await redis.set(`tokens:${profile.googleId}`, JSON.stringify(tokens));
 
   return {
+    id: row.id,
     apiKey: row.api_key,
     email: row.email,
     googleId: row.google_id,
     name: row.name,
-    isAdmin: row.is_admin === true,
+    authMethod: row.auth_method || 'google',
     createdAt: row.created_at.toISOString(),
     updatedAt: row.updated_at.toISOString(),
     tokens,
@@ -269,6 +363,21 @@ export async function getUserByGoogleId(googleId: string): Promise<UserRecord | 
   return fileGetUserByGoogleId(googleId);
 }
 
+export async function getUserByEmail(email: string): Promise<UserRecord | undefined> {
+  if (isDatabaseAvailable()) {
+    return dbGetUserByEmail(email);
+  }
+  return fileGetUserByEmail(email);
+}
+
+export async function getUserById(id: number): Promise<UserRecord | undefined> {
+  if (isDatabaseAvailable()) {
+    return dbGetUserById(id);
+  }
+  // File-based storage doesn't have IDs
+  return undefined;
+}
+
 export async function createOrUpdateUser(
   profile: { email: string; googleId: string; name: string },
   tokens: UserTokens
@@ -300,8 +409,6 @@ async function fileRegenerateApiKey(googleId: string): Promise<UserRecord | null
   const newApiKey = generateApiKey();
   existing.apiKey = newApiKey;
   existing.updatedAt = new Date().toISOString();
-  // Ensure isAdmin is always a boolean
-  existing.isAdmin = existing.isAdmin === true;
 
   // Store under new key
   users[newApiKey] = existing;
@@ -326,7 +433,7 @@ async function dbRegenerateApiKey(googleId: string): Promise<UserRecord | null> 
   const { rows } = await pool.query(
     `UPDATE users SET api_key = $1, updated_at = NOW()
      WHERE google_id = $2
-     RETURNING api_key, email, google_id, name, is_admin, created_at, updated_at`,
+     RETURNING id, api_key, email, google_id, name, auth_method, created_at, updated_at`,
     [newApiKey, googleId]
   );
 
@@ -335,11 +442,12 @@ async function dbRegenerateApiKey(googleId: string): Promise<UserRecord | null> 
   if (!tokensJson) return null;
 
   return {
+    id: row.id,
     apiKey: row.api_key,
     email: row.email,
     googleId: row.google_id,
     name: row.name,
-    isAdmin: row.is_admin === true,
+    authMethod: row.auth_method || 'google',
     createdAt: row.created_at.toISOString(),
     updatedAt: row.updated_at.toISOString(),
     tokens: JSON.parse(tokensJson),
