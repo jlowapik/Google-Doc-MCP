@@ -35,7 +35,6 @@ const BASE_SCOPES = [
 ];
 
 const BASE_URL = (process.env.BASE_URL || 'http://localhost:8080').replace(/\/+$/, '');
-const CANONICAL_HOSTNAME = new URL(BASE_URL).hostname;
 const COOKIE_SECRET = process.env.COOKIE_SECRET || 'dev-secret-change-me';
 const SESSION_MAX_AGE = 7 * 24 * 60 * 60 * 1000; // 7 days
 
@@ -62,19 +61,10 @@ export function createWebApp(docsMcpPort: number, calendarMcpPort: number): expr
     res.status(200).json({ status: 'ok' });
   });
 
-  // Redirect to canonical domain if BASE_URL is set and request is on a different host.
-  // Railway rewrites the Host header, so we must use X-Forwarded-Host to get the original.
-  // If X-Forwarded-Host is absent, skip redirect (safe default to avoid loops).
-  if (!BASE_URL.includes('localhost')) {
-    app.use((req, res, next) => {
-      const originalHost = (req.get('x-forwarded-host') || '').split(':')[0];
-      if (originalHost && originalHost !== CANONICAL_HOSTNAME) {
-        res.redirect(301, `${BASE_URL}${req.originalUrl}`);
-        return;
-      }
-      next();
-    });
-  }
+  // Serve BASE_URL to frontend so dashboard uses the canonical domain for MCP URLs
+  app.get('/api/config', (_req, res) => {
+    res.json({ baseUrl: BASE_URL });
+  });
 
   // NOTE: No OAuth routes registered here. MCP authentication uses apiKey
   // from the URL query string (issued via the dashboard). This prevents
@@ -102,10 +92,9 @@ export function createWebApp(docsMcpPort: number, calendarMcpPort: number): expr
   });
   app.use(calendarProxy);
 
-  // Portal landing page - always show (no redirect to dashboard)
-  // Must be before express.static to intercept requests for /
+  // Redirect to landing page on Vercel
   app.get('/', (_req, res) => {
-    res.sendFile(path.join(publicDir, 'index.html'));
+    res.redirect('https://awesome-mcp.xyz');
   });
 
   // Login shortcut - redirect to Google OAuth
@@ -1118,19 +1107,12 @@ export function createWebOnlyApp(): express.Express {
     res.status(200).json({ status: 'ok' });
   });
 
-  // Redirect to canonical domain if BASE_URL is set and request is on a different host.
-  // Railway rewrites the Host header, so we must use X-Forwarded-Host to get the original.
-  // If X-Forwarded-Host is absent, skip redirect (safe default to avoid loops).
-  if (!BASE_URL.includes('localhost')) {
-    app.use((req, res, next) => {
-      const originalHost = (req.get('x-forwarded-host') || '').split(':')[0];
-      if (originalHost && originalHost !== CANONICAL_HOSTNAME) {
-        res.redirect(301, `${BASE_URL}${req.originalUrl}`);
-        return;
-      }
-      next();
-    });
-  }
+  // Serve BASE_URL to frontend so dashboard uses the canonical domain for MCP URLs
+  app.get('/api/config', (_req, res) => {
+    res.json({ baseUrl: BASE_URL });
+  });
+
+
 
   // NOTE: OAuth routes (registerOAuthRoutes) are NOT registered here.
   // In multi-service mode, MCP URLs include apiKey directly (from dashboard).
@@ -1141,9 +1123,9 @@ export function createWebOnlyApp(): express.Express {
   // full URL from the dashboard (which includes the apiKey). Since MCP services
   // don't advertise OAuth either, the apiKey is used as-is.
 
-  // Portal landing page - always show (no redirect to dashboard)
+  // Redirect to landing page on Vercel
   app.get('/', (_req, res) => {
-    res.sendFile(path.join(publicDir, 'index.html'));
+    res.redirect('https://awesome-mcp.xyz');
   });
 
   // Login shortcut - redirect to Google OAuth
