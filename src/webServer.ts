@@ -94,7 +94,7 @@ export function createWebApp(docsMcpPort: number, calendarMcpPort: number): expr
 
   // Redirect to landing page on Vercel
   app.get('/', (_req, res) => {
-    res.redirect('https://awesome-mcp.xyz');
+    res.redirect('/dashboard');
   });
 
   // Login shortcut - redirect to Google OAuth
@@ -1125,7 +1125,7 @@ export function createWebOnlyApp(): express.Express {
 
   // Redirect to landing page on Vercel
   app.get('/', (_req, res) => {
-    res.redirect('https://awesome-mcp.xyz');
+    res.redirect('/dashboard');
   });
 
   // Login shortcut - redirect to Google OAuth
